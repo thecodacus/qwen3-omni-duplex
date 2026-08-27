@@ -26,11 +26,13 @@ def main(argv: list[str] | None = None) -> int:
                    add_help=False)
     sub.add_parser("stream-verify", help="prove the stateful vocoder matches the batch result frame-by-frame",
                    add_help=False)
+    sub.add_parser("clock-real", help="real-weights clock-path latency (talker + MTP + streaming vocoder)",
+                   add_help=False)
 
     # bench/thesis own the rest of the argv so their flags pass through untouched
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] in ("bench", "thesis", "vocoder", "stream-verify"):
+    if argv and argv[0] in ("bench", "thesis", "vocoder", "stream-verify", "clock-real"):
         cmd, rest = argv[0], argv[1:]
         sys.argv = [f"duplex {cmd}", *rest]
         if cmd == "bench":
@@ -39,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
             from duplex.thesis.vocoder_standalone import main as run
         elif cmd == "stream-verify":
             from duplex.streaming.verify import main as run
+        elif cmd == "clock-real":
+            from duplex.streaming.talker import main as run
         else:
             from duplex.thesis.vocoder import main as run
         run()
