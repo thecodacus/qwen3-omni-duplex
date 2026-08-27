@@ -1,0 +1,23 @@
+[project]
+name = "qwen3-omni-duplex"
+version = "0.1.0"
+description = "Full-duplex retrofit of Qwen3-Omni: pin the clock path, defer the background half"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=4.57",
+    "compressed-tensors>=0.8",
+    "accelerate>=1.0",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+duplex = "duplex.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

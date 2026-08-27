@@ -1,0 +1,12 @@
+.git/
+.github/
+models/
+out/
+results/
+docs/
+**/__pycache__/
+*.wav
+*.safetensors
+*.gguf
+.venv/
+README.md

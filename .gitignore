@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# never commit weights or generated audio
+models/
+out/
+*.safetensors
+*.gguf
+*.wav
+*.json.gz
+results/*.json

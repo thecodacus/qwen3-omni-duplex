@@ -1,0 +1,17 @@
+services:
+  duplex:
+    build: .
+    image: ghcr.io/thecodacus/qwen3-omni-duplex:latest
+    volumes:
+      - ${MODELS_DIR:-/root/models}:/models
+      - ${OUT_DIR:-./out}:/out
+    environment:
+      - MODEL_PATH=/models/Qwen3-Omni-AWQ
+      - OUT_DIR=/out
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
