@@ -120,7 +120,7 @@ The single 95.6 ms outlier is the real engineering problem — one frame per 4 m
 glitch per 4 minutes. Almost certainly allocator or scheduling jitter; CUDA graphs and a priority
 stream are the fix.
 
-## 5. Open — the vocoder thesis
+## 5. Measured — the vocoder thesis
 
 The output path ends at:
 
@@ -137,9 +137,45 @@ talker_wavs = self.code2wav.chunked_decode(talker_codes, chunk_size=300, left_co
 That loss is currently paid once per 24 s. At `chunk_size=1` it is paid *every frame*. And
 `left_context_size=25` means 2 s of context recomputed per 80 ms frame.
 
-`duplex thesis` sweeps `chunk_size` over {300, 100, 25, 5, 2, 1} on identical codes and measures
-sample loss, waveform MSE, log-STFT distance, and per-frame decode latency against the 24 s
-baseline. This is vocoder-only — it does not need the Thinker at all.
+### Result: timing passes, `chunked_decode` fails
+
+code2wav is unquantized in the AWQ build (230 tensors, 0 packed, one shard), so it loads standalone
+on the GPU in 0.4 GB — which also sidesteps the compressed-tensors/accelerate offload bug that
+blocks loading the full 30B model on 12 GB.
+
+**Compute is not the constraint.** At `chunk_size=1`, decode costs **22.45 ms/frame against an
+80 ms budget** — despite doing 26× redundant work (26 codes processed to keep 1). Dropping
+`left_context_size` to 0 takes it to ~10 ms/frame. Comfortable either way.
+
+**But `chunked_decode` is structurally lossy.** It is stateless: each chunk re-runs `forward()`
+and the causal transposed convolutions lose a fixed **545.8-sample (22.7 ms) tail** per call. One
+tail per chunk:
+
+| chunk_size | chunk | samples kept | lost vs 24 s baseline | ms/frame |
+|---|---|---|---|---|
+| 300 | 24 s | 479445 | — | 3.55 |
+| 25 | 2 s | 474450 | 4995 | 2.33 |
+| 5 | 400 ms | 452250 | 27195 | 5.09 |
+| 1 | **80 ms** | 341250 | **138195 (28.8%)** | 22.45 |
+
+At 80 ms frames, **28.9% of every frame is discarded**. Critically, what survives is *bit-accurate*
+— `max|cs1 − ref|` over the kept 1365 samples is 0.0035, the bf16 noise floor. So this is clean
+truncation, not corruption, and the MSE/log-STFT columns in the sweep are measuring the resulting
+time-shift rather than artefact severity. They should be ignored.
+
+`left_context_size` does not affect the loss at all (the tail is the same either way); trimming it
+is purely a compute optimisation.
+
+### What that implies
+
+`chunked_decode` is a batch convenience wrapper, never intended for streaming, and no parameter
+choice makes it viable at frame granularity. The fix is a **stateful vocoder**: carry the causal
+convolutions' tail state across calls instead of discarding and recomputing it. This is standard
+streaming-convolution practice and what Mimi/Moshi already does — and it is almost certainly what
+Alibaba's Realtime API uses internally, since the shipped wrapper could not support it.
+
+Consequence: it also removes the 26× redundancy, because a stateful decoder needs no left context
+at all. Expect well under 10 ms/frame.
 
 ## 6. Still unknown after that
 
