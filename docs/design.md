@@ -196,3 +196,44 @@ layer's hidden states as a routable output, which the tap requires.
 It is nonetheless the destination. The benchmark says we are overhead-bound, and llama.cpp is what
 removes that overhead. The order is: prove the architecture in transformers, then port. Doing it in
 ggml first means weeks of C++ to answer a question a Python script answers in an afternoon.
+
+## 6. Solved — the stateful vocoder
+
+`src/duplex/streaming/code2wav.py` wraps `Qwen3OmniMoeCode2Wav` in place and makes its conv stack
+stateful. Two kinds of state, installed by walking the module tree:
+
+- **`CausalConvNet`** (stride 1) zero-pads `padding` frames on the left every call. Streaming
+  prepends the previous call's trailing `padding` input frames instead.
+- **`CausalTransConvNet`** (kernel = 2·stride) emits `(L-1)s + k` samples then trims `s` from each
+  end. The right trim is the region later inputs still contribute to, so streaming overlap-adds it:
+  `U = conv(x); U[:s] += tail; emit U[:-s]; tail = U[-s:]`. The left trim is warm-up, applied only
+  on the first call.
+
+**The bias trap.** All six transposed convs carry a bias. Two consecutive chunks both cover the
+shared region, so overlap-adding biased outputs counts the bias twice. The convolution must run
+bias-free and the bias be added once to what is emitted. Getting this wrong cost `max err 0.67`;
+fixing it dropped that to `0.073` (bf16) / `0.003` (float32).
+
+### Verified (`duplex stream-verify`, 120 frames)
+
+| path | samples | /frame | loss | max err |
+|---|---|---|---|---|
+| reference (unchunked `forward`) | 229845 | 1915.4 | 0.2% | — |
+| shipped `chunked_decode(cs=1)` | 163800 | 1365.0 | **28.9%** | 1.111 |
+| **streaming (stateful)** | **229845** | **1915.4** | **0.2%** | **0.003** (fp32) |
+
+Sample-exact against the batch path, and the residual 0.003 is float32 rounding, not logic — it
+grows smoothly with stream length (0.0020 @40 → 0.0054 @200 frames) with no discontinuity at the
+`sliding_window: 72` boundary, while mean error stays flat at ~0.00004. At −46 dB it is inaudible.
+
+The `/frame` figure converging on 1920 (1906 @40 → 1917 @200) confirms the remaining 0.2% is a
+one-time warm-up amortising over the stream, not a per-frame loss.
+
+**Latency: 9.43 ms/frame mean, p99 9.68 ms**, against an 80 ms budget — 8× headroom, and ~2.5×
+faster than the broken `chunked_decode(cs=1)` path because no left context is recomputed.
+
+### Known limitation
+
+The `pre_transformer` KV cache grows unbounded. Masking is correct, but a real conversation runs far
+past 72 frames, so a windowed cache is needed to bound memory and attention cost. Not a correctness
+issue; an efficiency one.

@@ -24,17 +24,21 @@ def main(argv: list[str] | None = None) -> int:
                    add_help=False)
     sub.add_parser("vocoder", help="standalone code2wav sweep: chunk_size + left_context (no Thinker needed)",
                    add_help=False)
+    sub.add_parser("stream-verify", help="prove the stateful vocoder matches the batch result frame-by-frame",
+                   add_help=False)
 
     # bench/thesis own the rest of the argv so their flags pass through untouched
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] in ("bench", "thesis", "vocoder"):
+    if argv and argv[0] in ("bench", "thesis", "vocoder", "stream-verify"):
         cmd, rest = argv[0], argv[1:]
         sys.argv = [f"duplex {cmd}", *rest]
         if cmd == "bench":
             from duplex.bench.clock import main as run
         elif cmd == "vocoder":
             from duplex.thesis.vocoder_standalone import main as run
+        elif cmd == "stream-verify":
+            from duplex.streaming.verify import main as run
         else:
             from duplex.thesis.vocoder import main as run
         run()
