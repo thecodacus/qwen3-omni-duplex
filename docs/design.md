@@ -322,3 +322,59 @@ Added to dodge the OOM above and left on, it cost nothing on the mean (33.52 vs
 31.79) but added a **68 ms p99.9 to the vocoder** — a stage the fusion does not
 touch — pushing TOTAL p99.9 to 90.43 and failing the budget. On a throughput
 benchmark it would have looked free.
+
+## 10. The int4 wall — where a real quantized kernel becomes necessary
+
+Section 9's fusion works for bf16. Applying the same gather+bmm to the packed
+Thinker (`fused_packed_moe.py`, gather -> `unpack4` on GPU -> scale -> bmm) does not
+get there.
+
+The batched unpack is verified correct — bit-identical (`max|diff| = 0.000e+00`) to
+the 2-D `dequantize_weight` path across gate_proj (768×2048), down_proj (2048×768)
+and q_proj (4096×2048), and consistent across a broadcast batch dim. The problem is
+cost, not correctness:
+
+```
+per fused packed MoE layer   4.078 ms mean, 4.118 p99
+x24 layers                   97.9 ms
++ attention (~20% more)     ~122 ms
+headroom available            43.1 ms
+```
+
+**Why 4.078 ms is slow.** That layer's 8 active experts are 37.7M params = 21 MB at
+int4, which is 0.06 ms of bandwidth on a 3060. We are 68x off. The fusion removed
+the *launch* overhead but added a new one: dequantization materialises full dense
+weights (37.7M params -> 75 MB bf16) and runs five separate elementwise passes over
+them — shift, mask, subtract, reshape, scale — before the matmul begins. That is
+~375 MB of traffic per layer to avoid reading 21 MB.
+
+A real int4 kernel (Marlin, or llama.cpp's quantized GEMV) dequantizes **in registers
+inside** the matmul and never writes dense weights to memory. That cannot be
+expressed in PyTorch ops; it is a CUDA/Triton kernel.
+
+### Where that leaves realtime
+
+| stage | dtype | PyTorch fusion sufficient? |
+|---|---|---|
+| Talker, code predictor | bf16 | **yes** — 41.95 -> 17.36 ms |
+| streaming vocoder | bf16 | yes — 10.5 ms |
+| Thinker[0:24] | **int4** | **no** — needs a fused dequant-GEMV |
+
+Two prior claims in this document were each half right. "transformers cannot make the
+deadline, llama.cpp is mandatory" was wrong for the bf16 stages — a gather fixed
+those. "llama.cpp is not mandatory" was wrong for the int4 stage. The dividing line
+is dtype, not framework.
+
+There is also a memory constraint independent of speed: `Thinker[0:24]` packed is
+~8.2 GB (7.25 GB nibbles + 0.9 GB fp16 scales) and the fused bf16 talker is 6.1 GB.
+Both do not fit a 12 GB card, so a full-clock-path system needs the talker quantized
+too, or the thinker's experts streamed from host RAM per token (453 MB/token over
+PCIe at 25.9 GB/s = 17.5 ms, which the 43.1 ms headroom would absorb).
+
+### Options, in increasing order of work
+
+1. **Marlin via vLLM** — the checkpoint is already compressed-tensors format, which
+   vLLM serves with Marlin kernels. Does not expose layer-24 hidden states.
+2. **A Triton dequant-GEMV** — fuse unpack+scale+matmul into one kernel. Self-contained
+   and keeps everything else as-is.
+3. **llama.cpp** — has the kernels, lacks the Talker, MTP, Code2Wav and the tap.
