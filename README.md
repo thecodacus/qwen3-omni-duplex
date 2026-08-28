@@ -33,18 +33,23 @@ Half-duplex turns out to be *orchestration*, not architecture — the reference 
 per-token and can be streamed.
 
 Full derivation, with source citations: [`docs/design.md`](docs/design.md).
+Chronological log of findings and wrong turns: [`JOURNEY.md`](JOURNEY.md).
 
 ## Status
 
 - [x] Architecture verified against `modular_qwen3_omni_moe.py` and `config.json`
 - [x] **Clock-path deadline benchmark passes** — p99.9 of 55.5 ms clean / 64.4 ms under PCIe
       contention, against an 80 ms budget, 8.74 GB resident on an RTX 3060
-- [ ] Vocoder thesis: can `code2wav` decode at `chunk_size=1` (80 ms) instead of `300` (24 s)?
-- [ ] Streaming Thinker→Talker (per-token instead of post-generate)
+- [x] **Vocoder streams at 80 ms frames** — the shipped `chunked_decode` drops 28.9% of every
+      frame; a stateful rewrite is sample-exact at 9.43 ms/frame
+- [x] **Quantized Thinker runs** — on-the-fly int4 dequant, verified by coherent speech
+- [x] **Realtime clock path: ~66 ms against an 80 ms budget**, 10.74 GB — via a fused MoE
+      (41.95 → 17.36 ms), a Triton dequant-GEMV (4.078 → 0.639 ms/layer) and partial residency
+- [x] llama.cpp turns out **not** to be required — the dividing line was in-memory vs in-register
+      dequantization, not framework
+- [ ] Wire the clock path into one running loop
 - [ ] Silence-frame semantics (`codec_nothink_id` already exists in the codec vocab)
 - [ ] Dual-channel training for interrupt/backchannel behaviour
-- [ ] llama.cpp port — it supports Qwen3-Omni's *audio input* only; the Talker, MTP and Code2Wav
-      are unimplemented upstream
 
 ## Usage
 

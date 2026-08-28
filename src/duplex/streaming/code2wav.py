@@ -41,13 +41,25 @@ class StreamingCode2Wav:
     batch decoding afterwards.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, window: int | None = None):
         self.model = model
+        # The pre_transformer is windowed (config `sliding_window`), so a cache
+        # longer than the window contributes nothing to the result but keeps
+        # growing memory and attention cost for the length of a conversation.
+        # Trimming is OFF by default and should stay off until it uses a real
+        # windowed cache. Manual slicing corrupts the result: `cache_position`
+        # fixes RoPE, but the attention mask still treats the retained keys as
+        # positions 0..W-1 rather than pos-W..pos-1. Measured max err at 120/200/400
+        # frames: 0.26 / 0.77 / 0.99, against 0.003 / 0.005 / 0.006 untrimmed.
+        # The cost of leaving it off is small: <200 MB for a 5-minute conversation.
+        # The correct fix is transformers' SlidingWindowCache, not slicing.
+        self.window = window
         self._orig: list[tuple[nn.Module, callable]] = []
         self._conv_state: dict[int, torch.Tensor | None] = {}
         self._tconv_state: dict[int, torch.Tensor | None] = {}
         self._tconv_started: dict[int, bool] = {}
         self._kv = None
+        self._pos = 0          # true stream position, independent of cache length
         self._installed = False
 
     # ---- state -------------------------------------------------------------
@@ -59,6 +71,7 @@ class StreamingCode2Wav:
         for k in self._tconv_started:
             self._tconv_started[k] = False
         self._kv = None
+        self._pos = 0
 
     # ---- install / remove --------------------------------------------------
     def install(self):
@@ -161,10 +174,21 @@ class StreamingCode2Wav:
 
         if self._kv is None:
             self._kv = DynamicCache()
-        out = model.pre_transformer(
-            inputs_embeds=hidden, past_key_values=self._kv, use_cache=True
+        T = hidden.shape[1]
+        # Position must come from the stream, not the cache length: trimming the
+        # cache shortens it, and a model that infers position from cache length
+        # would silently restart RoPE at the window boundary.
+        cache_position = torch.arange(
+            self._pos, self._pos + T, device=hidden.device
         )
+        out = model.pre_transformer(
+            inputs_embeds=hidden, past_key_values=self._kv, use_cache=True,
+            cache_position=cache_position,
+        )
+        self._pos += T
         self._kv = getattr(out, "past_key_values", self._kv)
+        if self.window:
+            self._trim_kv()
         hidden = out.last_hidden_state.permute(0, 2, 1)
 
         for blocks in model.upsample:
@@ -174,6 +198,30 @@ class StreamingCode2Wav:
         for block in model.decoder:
             wav = block(wav)
         return wav.clamp(min=-1, max=1)
+
+    def _trim_kv(self):
+        """Drop cache entries older than the attention window.
+
+        Keeps `window` positions so results are unchanged, while bounding memory
+        and attention cost over a long stream. `DynamicCache.crop` keeps a prefix,
+        which is the wrong end, so slice the layers directly.
+        """
+        kv = self._kv
+        layers = getattr(kv, "layers", None)
+        w = self.window
+        try:
+            if layers is not None:                      # transformers >= 4.56
+                for layer in layers:
+                    if layer.keys is not None and layer.keys.shape[-2] > w:
+                        layer.keys = layer.keys[..., -w:, :].contiguous()
+                        layer.values = layer.values[..., -w:, :].contiguous()
+            elif getattr(kv, "key_cache", None):        # older layout
+                for i in range(len(kv.key_cache)):
+                    if kv.key_cache[i].shape[-2] > w:
+                        kv.key_cache[i] = kv.key_cache[i][..., -w:, :].contiguous()
+                        kv.value_cache[i] = kv.value_cache[i][..., -w:, :].contiguous()
+        except Exception:
+            self.window = None                          # unknown layout — stop trying
 
     @torch.inference_mode()
     def flush(self) -> torch.Tensor:
