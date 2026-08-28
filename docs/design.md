@@ -533,3 +533,87 @@ KV growth does not threaten the margin: thinker 24.5 KB/token + talker 10 KB/tok
 under 200 MB for a 5-minute conversation.
 
 N=8 (28.9 ms, 9.33 GB, ~70 ms total) trades 4 ms for 1.4 GB if more headroom is wanted.
+
+## 14. How duplex actually works — Moshi's mechanism, and the exact gap
+
+There is **no TML paper**. The blog post sketches the architecture and explicitly
+withholds the mechanism: it does not detail how the model decides when to speak
+versus stay silent, and gives no data, corpus size, or RL specifics. It does confirm
+276B-A12B, FD-bench V1 latency of 0.40 s (vs Gemini-3.1-flash-live 0.57,
+GPT-Realtime-2 1.18), and that duplex is "a core architectural property rather than
+something added via external scaffolding such as voice-activity detection or separate
+dialog managers."
+
+[Moshi](https://arxiv.org/html/2410.00037v2) is a real paper and the only fully
+specified open full-duplex system. Its mechanism:
+
+**Stream layout.** K = 2Q+1 = 17 parallel streams per timestep (Q=8 codec levels):
+
+```
+k = 1              aligned text token (Inner Monologue)
+k = 2 .. 2+Q       Moshi's own audio  (semantic + delayed acoustic)
+k = 2+Q+1 .. K     the user's audio
+```
+
+> "tokens are predicted from bottom to top in the Depth Transformer. At inference
+> time, tokens under the dashed line (corresponding to Moshi) are sampled, while
+> those above are fed from the user."
+
+The user is not a prefix. Their audio occupies its own streams at **every** timestep,
+fed as input while the model's own tokens are sampled.
+
+**Silence has no token.**
+
+> "when the user speaks and Moshi stays silent, the corresponding audio tokens for
+> Moshi's stream decode into 'natural silence,' a near silent waveform, instead of
+> having a fixed, well defined value."
+
+This independently confirms section 2's correction: silence is ordinary codec output,
+not a reserved id.
+
+**No turn state exists.**
+
+> "There is no explicit boundaries for the change of turns between the user and Moshi:
+> Moshi can speak and listen at all time, and do both at once if needed."
+
+**The text stream is the control surface.** Word-level Whisper timestamps are mapped
+onto the 12.5 Hz grid; `PAD` fills inter-word timesteps and `EPAD` marks transitions.
+"Forcing the sampling of a EPAD token will make Moshi start talking immediately."
+
+### The gap for Qwen3-Omni, precisely
+
+| | Moshi | Qwen3-Omni today |
+|---|---|---|
+| frame grid | 12.5 Hz | 12.5 Hz — **same** |
+| own audio stream | sampled per timestep | sampled per timestep — **same** |
+| text stream | one token per timestep, **word-aligned** to the audio | one hidden per timestep, but **front-loaded**: measured 34 tokens over 129–160 frames, exhausted in ~2.7 s then `tts_pad_embed` |
+| user audio | parallel stream, fed **every** timestep | **prefix only** — `_get_talker_user_parts` projects the whole turn retrospectively |
+| silence | natural silence from ordinary codec tokens | producible (15.4%/10.1% silent frames measured), not controllable |
+
+So two changes are needed, and one is larger than previously stated:
+
+1. **Feed user audio per timestep** rather than as a prefix. The projection path already
+   exists (`hidden_projection` of layer-24 hiddens for audio positions); it is fed at the
+   wrong cadence.
+2. **Re-align the text stream to speech timing.** Moshi's control mechanism *depends* on
+   the text stream being word-synchronous — that is what makes "force EPAD to start
+   talking" work. Qwen3-Omni front-loads its text instead. Converting it to a
+   word-aligned stream (Whisper timestamps → 12.5 Hz grid → PAD/EPAD equivalent) is a
+   change to the conditioning format, not just the injection cadence.
+
+Point 2 was not visible before reading Moshi. The earlier measurement that
+`trailing_text_hidden` covers only 21–26% of frames was recorded as a curiosity; it is
+actually the second structural difference from a duplex model.
+
+### Training stages, for scale
+
+| phase | steps | data |
+|---|---|---|
+| Helium pre-training | 500k | text, 4.2M tokens/batch |
+| Moshi pre-training | 1M | 7M hours unsupervised audio |
+| post-training | 100k | diarization-based simulated multi-stream |
+| **Fisher fine-tuning** | **10k batches** | **2000 h real dual-channel** |
+| instruction FT | 30k | 20k+ h synthetic |
+
+Only the last two teach duplex behaviour, and phase 3 shows diarized single-channel
+audio is sufficient for the bulk of it.
