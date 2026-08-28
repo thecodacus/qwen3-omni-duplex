@@ -462,3 +462,66 @@ when the host rebooted mid-run (silently — no traceback, initially misattribut
 print buffering). The second had no frame cap, so the injected condition simply
 generated for 42 minutes against baseline's 6, making "went quiet" indistinguishable
 from "ran longer".
+
+## 19. The full clock path, in one loop
+
+Every realtime number until now was measured per stage. Assembling them exposed two
+bugs that isolation had hidden.
+
+**First run** (8 pinned / 16 streamed):
+
+```
+thinker 245.79   talker 17.28   mtp 3.89   vocoder 10.54   total 277.51
+p99.9 288.93 vs 80 ms -> FAIL, 150/150 over
+```
+
+Talker, MTP and vocoder matched their isolated benchmarks to within 0.1 ms. The
+thinker was 7x over prediction. Running it alone attributed the cost:
+
+```
+24 pinned, no streaming   230.86 ms
+ 8 pinned, 16 streamed    245.79 ms   -> streaming = 0.93 ms/layer, matching config B
+```
+
+So streaming was fine. Two things were not.
+
+**Bug 1: attention on the torch dequant path.** Documented in the code as "4
+linears/layer, ~7 MB packed each -- not worth a kernel yet". That sized it by
+*packed* bytes; cost is set by *dequantized* work. q and o are 4096x2048, so
+attention materialises 452M params/token to dense across 96 calls — ~215 ms of the
+230. Moving it onto the Triton kernel (a Linear is the E=1 case of the expert
+gather): **230.86 -> 110.86 ms**.
+
+**Bug 2: the Triton kernel was never called.** `FusedPackedMoE.forward` used
+`_dequant`, the torch path, throughout. The kernel had been written, verified at rel
+error 2.5e-07, benchmarked at 6.4x, documented as the solution — and not wired in.
+24 x 4.078 = 97.9 ms, which is exactly the "unexplained" remainder that had been
+attributed to launch overhead. **110.86 -> 27.67 ms.**
+
+While fixing it, the kernel gained per-expert activations (`s_x` stride) so the
+down-projection is one launch rather than eight: two launches per layer, down from
+nine.
+
+**Bug 3: the vocoder's growing cache.** Full path then passed on the mean (71.92) but
+failed p99.9 at 85.38, and the tail was isolated to the vocoder: 22.88 p99.9 against
+a 10.22 mean while every other stage was tight. Cause was a `DynamicCache`
+reallocating and copying every frame — O(n^2) over a stream. Preallocating once:
+**22.88 -> 13.07 p99.9**, correctness unchanged (max err 0.00608).
+
+**Final, all stages real, one loop, RTX 3060:**
+
+| stage | mean | p99.9 |
+|---|---|---|
+| thinker (8 pinned / 16 streamed) | 40.95 | 44.45 |
+| talker | 17.11 | 19.35 |
+| code predictor | 3.85 | 4.45 |
+| streaming vocoder | 11.06 | 13.07 |
+| **total** | **72.96** | **77.16** |
+
+**PASS: 0/150 frames over an 80 ms budget, 10.24 GB resident, 1.10x realtime.**
+
+Margin is 2.8 ms (3.5%), with synthetic conditioning — real routing could move the
+thinker. CUDA graphs and the pinned/streamed split are both untouched levers.
+
+The pattern across all three bugs: a component measured in kinder conditions than it
+runs in. That is what the loop was built to catch, and it caught three.

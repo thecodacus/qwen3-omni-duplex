@@ -47,7 +47,8 @@ Chronological log of findings and wrong turns: [`JOURNEY.md`](JOURNEY.md).
       (41.95 → 17.36 ms), a Triton dequant-GEMV (4.078 → 0.639 ms/layer) and partial residency
 - [x] llama.cpp turns out **not** to be required — the dividing line was in-memory vs in-register
       dequantization, not framework
-- [ ] Wire the clock path into one running loop
+- [x] **Clock path runs end to end: 77.16 ms p99.9 vs an 80 ms budget, 0/150 frames over,
+      10.24 GB resident** — measured in one loop, not projected from per-stage numbers
 - [ ] Silence-frame semantics — no existing mechanism; the codec special tokens are a
       one-shot mode/voice preamble, not per-frame control (see `docs/design.md` §2)
 - [ ] Dual-channel training for interrupt/backchannel behaviour
