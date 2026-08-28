@@ -114,7 +114,7 @@ def main():
         if isinstance(seq, str):
             said = seq
         else:
-            ids = seq
+            ids = getattr(seq, "sequences", seq)   # GenerateDecoderOnlyOutput
             if isinstance(ids, (list, tuple)):
                 ids = ids[0]
             if torch.is_tensor(ids) and ids.ndim == 1:
