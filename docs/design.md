@@ -237,3 +237,45 @@ faster than the broken `chunked_decode(cs=1)` path because no left context is re
 The `pre_transformer` KV cache grows unbounded. Masking is correct, but a real conversation runs far
 past 72 frames, so a windowed cache is needed to bound memory and attention cost. Not a correctness
 issue; an efficiency one.
+
+## 8. Manual hybrid device placement fights transformers
+
+`place_unpacked()` implements the MoE-offload split — packed experts in host RAM,
+everything dense on the GPU, packed tensors shipped per call so activations never
+move. It works, and the footprint is right:
+
+```
+code2wav              0.40 GB
+talker                6.59 GB   (3325M params)
+thinker text stack    7.20 GB   (324M dense moved, 4671M packed left in host RAM)
+```
+
+4.4 GB spare on a 12 GB card, with ~15 GB of int4 expert weight never resident.
+
+**But `generate()` does not survive it.** transformers assumes uniform placement and
+builds helper tensors accordingly. Failures appear one line at a time, each ~15 min
+of load away:
+
+- `inputs` left on CPU while embeddings are on GPU
+- `thinker.lm_head` sits outside `thinker.model`, so a submodule-scoped placement misses it
+- `modeling_qwen3_omni_moe.py:3993` builds `talker_special_tokens` on the CPU and feeds
+  it a GPU embedding — library code, not ours
+
+The module map that would have saved three of those cycles is derivable from
+`model.safetensors.index.json` without loading anything:
+
+| thinker submodule | packed | dense |
+|---|---|---|
+| `model` | 18624 | 242 |
+| `lm_head` | 0 | 1 |
+| `audio_tower` | 0 | 525 |
+| `visual` | 0 | 351 |
+
+Note this also shows **attention is quantized**: 48 × (4 attention + 128 experts × 3)
+= 18624, exactly the packed count. The only dense weights in the thinker are
+embeddings, norms and `lm_head`.
+
+**Conclusion:** hybrid placement needs a real `device_map` through accelerate, not
+manual `.to()` calls. For the offline quality gate — which is latency-insensitive —
+CPU-only is the right tool, and `--cpu` selects it. The GPU split belongs with the
+llama.cpp port, where `--n-cpu-moe` already does this properly.

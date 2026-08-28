@@ -119,27 +119,26 @@ def patch_packed_linears(
     return n
 
 
-def place_thinker(model: nn.Module, device="cuda", verbose: bool = True) -> dict:
-    """Attention/norms/embeddings to `device`; packed experts stay in host RAM.
+def place_unpacked(root: nn.Module, device="cuda", verbose: bool = True) -> dict:
+    """Move `root`'s *unpacked* params/buffers to `device`; leave packed ones behind.
 
-    The MoE-offload split, and the asymmetry is extreme:
+    Call this on specific submodules, never on the whole Qwen3OmniMoe model — that
+    sweeps in the talker (6.2 GB), code2wav, and both the audio and vision towers,
+    which OOMs a 12 GB card before it gets anywhere useful.
 
-        attention (48 layers, GQA 32q/4kv)  452M params  ->  0.9 GB bf16
-        embeddings (152064 x 2048)          311M params  ->  0.6 GB
-        experts (packed int4)               29.0B params -> ~15 GB
-
-    ~1.5 GB of dense weight belongs on the GPU; only the packed experts have to
-    stay behind. Their packed tensors are shipped per call by the patched forward,
-    so activations never leave the GPU.
+    Note what is and is not packed in this checkpoint: 48 x (4 attention linears +
+    128 experts x 3) = 18624 packed tensors, so **attention is quantized too**. The
+    only dense weights in the thinker are embeddings and norms. Everything packed is
+    shipped to the GPU per call by the patched forward instead.
     """
     moved = kept = 0
     packed_ids = set()
-    for mod in model.modules():
+    for mod in root.modules():
         if hasattr(mod, "weight_packed"):
             packed_ids.update(id(p) for p in mod.parameters(recurse=False))
             packed_ids.update(id(b) for b in mod.buffers(recurse=False))
 
-    for mod in model.modules():
+    for mod in root.modules():
         for name, p in list(mod.named_parameters(recurse=False)):
             if id(p) in packed_ids:
                 kept += p.numel()
@@ -155,9 +154,13 @@ def place_thinker(model: nn.Module, device="cuda", verbose: bool = True) -> dict
 
     stats = {"moved_params": moved, "kept_on_host": kept, "device": str(device)}
     if verbose:
-        print(f"placed {moved/1e6:.0f}M params on {device}; "
-              f"{kept/1e6:.0f}M packed elements kept in host RAM")
+        print(f"  placed {moved/1e6:.0f}M params on {device}, "
+              f"{kept/1e6:.0f}M packed elements left in host RAM")
     return stats
+
+
+# Back-compat alias; prefer place_unpacked on a specific submodule.
+place_thinker = place_unpacked
 
 
 def sanity_check(model: nn.Module, k: int = 3) -> list[dict]:
