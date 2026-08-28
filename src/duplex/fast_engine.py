@@ -66,7 +66,8 @@ class FastEngine:
 
     # ---- load ---------------------------------------------------------------
     def load(self, log=print):
-        from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+        from transformers import Qwen3OmniMoeProcessor
+        from duplex.loader import load_direct
         from duplex.streaming.fused_packed_moe import fuse_packed_moe_blocks
         from duplex.streaming.fused_moe import fuse_moe_blocks
         from duplex.streaming.triton_dequant_gemv import patch_attention_to_triton
@@ -74,16 +75,15 @@ class FastEngine:
         dev, dtype = "cuda", torch.bfloat16
         t0 = time.time()
 
-        self._set("loading weights", "reading shards (~13 min)")
-        model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-            self.model_path, device_map="cpu", dtype=dtype,
-        ).eval()
-
-        # Drop the vision tower before anything is placed: unused here, 0.5 GB.
+        # Direct loader, not from_pretrained: that spends ~480s of its ~910s in
+        # compressed-tensors' compress_model() building a parameter structure whose
+        # output we discard, since dequantization here is our own Triton kernel.
+        # Measured: 18s to place 64907 tensors, 0 unmatched.
+        self._set("loading weights", "direct shard read, skipping the compress pass")
+        model, _cfg = load_direct(self.model_path, device="cpu", dtype=dtype,
+                                  skip_vision=True, log=lambda m: self._set(
+                                      "loading weights", m))
         th = model.thinker
-        if getattr(th, "visual", None) is not None:
-            th.visual = None
-            gc.collect()
 
         self._set("fusing thinker MoE",
                   f"{self.n_pinned} layers pinned, rest streamed from host")
