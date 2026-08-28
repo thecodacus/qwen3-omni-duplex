@@ -436,3 +436,44 @@ and reuses work already done.
 - Attention's four packed linears per layer still use the torch dequant path and
   should move to the same kernel.
 - No CUDA graphs yet on the clock path.
+
+## 12. Where the experts live — measured
+
+Section 11 solved speed and promoted memory to the binding constraint. Three
+placements for `Thinker[0:24]`'s packed experts, all measured on the 3060 with the
+Triton kernel:
+
+| | thinker MoE (24 layers) | GPU memory | total clock path |
+|---|---|---|---|
+| **A. pinned** | 15.3 ms | 8.4 GB | ~56 ms ✓ / memory ✗ |
+| **B. streamed from host** | 37.8 ms | ~0.5 GB | ~79 ms ✗ / memory ✓ |
+| **C. LRU cache @ 90% hit** (projected) | ~17.6 ms | tunable | ~58 ms ✓ / memory ✓ |
+
+### B, measured
+
+```
+per-layer transfer, 8 experts   23.6 MB   -> 566 MB/token
+transfer only        0.954 ms   -> 24.7 GB/s effective
+full layer           1.575 ms   (vs 0.639 pinned)
+GPU staging          0.022 GB   (vs 0.35 GB) -- 16x less
+```
+
+24.7 GB/s is essentially the machine's measured 25.9 GB/s PCIe ceiling, so the
+transfer is at line rate and cannot be made faster — only smaller. It is 61% of the
+per-layer time.
+
+Totalling honestly: 36.85 ms (talker+MTP+vocoder, p99.9) + 37.8 ms (streamed MoE,
+mean) + ~4 ms attention = **~78.7 ms against 80 ms**. That mixes a p99.9 against a
+mean for a 1.3 ms margin, so B should be read as a **practical fail** — its own p99.9
+will exceed budget.
+
+### Why C is the answer
+
+The only remaining lever is transferring less, and an LRU expert cache is exactly
+that. At the 90% hit rate measured previously on this machine, per-layer transfer
+falls to ~0.095 ms, giving ~0.73 ms/layer and ~17.6 ms for 24 layers — near pinned
+speed at a fraction of the memory, with cache size as a tunable dial.
+
+C is also the only configuration that does sustained fetching *during* the clock
+path, so it is the one where the PCIe-DMA-steals-DRAM-bandwidth effect actually
+applies. That was measured at +18% for a deadline workload, which ~17.6 ms absorbs.
