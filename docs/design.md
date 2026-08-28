@@ -477,3 +477,42 @@ speed at a fraction of the memory, with cache size as a tunable dial.
 C is also the only configuration that does sustained fetching *during* the clock
 path, so it is the one where the PCIe-DMA-steals-DRAM-bandwidth effect actually
 applies. That was measured at +18% for a deadline workload, which ~17.6 ms absorbs.
+
+## 13. Partial residency — the working configuration
+
+Neither extreme works: pinning all 24 layers needs 8.4 GB and busts the card;
+streaming all 24 costs 37.8 ms and busts the budget. Splitting them is linear and
+tunable, and needs no hit-rate assumption:
+
+| N pinned | thinker MoE | thinker GB | + talker/vocoder (6.5 GB) | |
+|---|---|---|---|---|
+| 0 | 36.5 ms | 0.02 | 6.52 | fits |
+| 4 | 32.7 ms | 1.43 | 7.93 | fits |
+| 8 | 28.9 ms | 2.83 | 9.33 | fits |
+| **12** | **25.1 ms** | **4.24** | **10.74** | **fits** |
+| 14 | 23.1 ms | 4.94 | 11.44 | over |
+| 24 | 13.5 ms | 8.46 | 14.96 | over |
+
+Each pinned layer costs 0.316 GB (fp16 scales) and buys 0.94 ms.
+
+**N=12 is the working point:**
+
+```
+talker + MTP + vocoder    36.85 ms  (p99.9)
+thinker MoE, 12/12        25.1  ms
+thinker attention         ~4    ms
+                          --------
+                          ~66 ms   vs 80 ms budget, 14 ms margin
+```
+
+This is preferable to an LRU expert cache (section 12's config C) despite similar
+projected latency, because it is **deterministic**. Placement is static, so cost does
+not depend on routing locality — and a duplex clock path interleaves user-audio
+ingestion frames with assistant-text frames, which plausibly route to different
+expert sets and could thrash a cache. p99 tracks mean here because nothing is
+data-dependent.
+
+KV growth does not threaten the margin: thinker 24.5 KB/token + talker 10 KB/token is
+under 200 MB for a 5-minute conversation.
+
+N=8 (28.9 ms, 9.33 GB, ~70 ms total) trades 4 ms for 1.4 GB if more headroom is wanted.
