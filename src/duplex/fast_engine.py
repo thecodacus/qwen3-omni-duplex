@@ -105,6 +105,7 @@ class FastEngine:
         self._set("processor", "tokenizer + feature extractor")
         self.proc = Qwen3OmniMoeProcessor.from_pretrained(self.model_path)
         self.dev = dev
+        self.dtype = dtype
         gb = torch.cuda.memory_allocated() / 1024**3
         log(f"fast engine ready in {time.time()-t0:.0f}s, {gb:.2f} GB resident")
         self._set("ready", f"{gb:.2f} GB on GPU")
@@ -117,6 +118,12 @@ class FastEngine:
                                              tokenize=False)
         inputs = self.proc(text=text, audio=[user_audio], return_tensors="pt")
         inputs = inputs.to(self.dev)
+        # The processor emits float32 features; the model is bf16, and the audio
+        # tower's conv2d rejects the mismatch outright.
+        for k in list(inputs.keys()):
+            v = inputs[k]
+            if torch.is_tensor(v) and v.is_floating_point():
+                inputs[k] = v.to(self.dtype)
 
         with torch.inference_mode():
             seq, wav = self.model.generate(

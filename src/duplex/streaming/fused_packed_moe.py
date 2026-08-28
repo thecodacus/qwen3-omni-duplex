@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from duplex.streaming.triton_dequant_gemv import dequant_gemv, HAVE_TRITON
+
 NUM_BITS = 4
 PACK = 32 // NUM_BITS      # 8 nibbles per int32
 GROUP = 32
@@ -109,6 +111,9 @@ class FusedPackedMoE(nn.Module):
                                  dtype=dp.dtype, device=device), persistent=False)
             self.register_buffer("down_scale", torch.empty(k, *ds.shape[1:],
                                  dtype=ds.dtype, device=device), persistent=False)
+            self.register_buffer("_staged_idx",
+                                 torch.arange(k, dtype=torch.int32, device=device),
+                                 persistent=False)
             del gu_p, gu_s, dp, ds
         else:
             self.register_buffer("gu_packed", gu_p, persistent=False)
@@ -141,30 +146,30 @@ class FusedPackedMoE(nn.Module):
         w = w.to(x.dtype)
         T, k = sel.shape
 
-        if self.host_resident:
-            # Stage only the chosen experts. Each expert slice is contiguous, so
-            # this is k async copies per tensor rather than a host-side gather.
-            idx = sel[0].tolist()
-            for j, e in enumerate(idx):
-                self.gu_packed[j].copy_(self._h_gu_p[e], non_blocking=True)
-                self.gu_scale[j].copy_(self._h_gu_s[e], non_blocking=True)
-                self.down_packed[j].copy_(self._h_dn_p[e], non_blocking=True)
-                self.down_scale[j].copy_(self._h_dn_s[e], non_blocking=True)
-            sel = torch.arange(k, device=sel.device, dtype=sel.dtype).unsqueeze(0)
-
-        # Two kernel launches per layer. The torch path below (_dequant + matmul)
-        # materialises dense weights and measured 4.078 ms/layer against the
-        # kernel's 0.639 ms; it is kept only as a reference for correctness tests.
-        from duplex.streaming.triton_dequant_gemv import dequant_gemv, HAVE_TRITON
-
-        if HAVE_TRITON and T == 1:
-            s0 = sel[0]
-            gu = dequant_gemv(x[0], self.gu_packed, self.gu_scale, s0)     # [k, 2I]
-            g, u = gu.split(self.inter, dim=-1)
-            act = (F.silu(g) * u).to(x.dtype)                              # [k, I]
-            y = dequant_gemv(act, self.down_packed, self.down_scale, s0)   # [k, H]
-            y = (y.to(x.dtype) * w[0].unsqueeze(-1)).sum(dim=0, keepdim=True)
-            return y.view(shape)
+        if HAVE_TRITON:
+            # One token at a time. Prefill passes T>1, and the torch path below
+            # would materialise [T, k, 2I, H] dense weights for it -- measured at
+            # 2.91 GiB for a single layer. Looping never allocates dense weights.
+            #
+            # Host-resident layers must stage INSIDE this loop: each token selects
+            # its own experts, and staging once for token 0 leaves the kernel
+            # indexing an 8-slot buffer with expert ids up to 127 (illegal access).
+            outs = []
+            for t in range(T):
+                st = sel[t]
+                if self.host_resident:
+                    for j, e in enumerate(st.tolist()):
+                        self.gu_packed[j].copy_(self._h_gu_p[e], non_blocking=True)
+                        self.gu_scale[j].copy_(self._h_gu_s[e], non_blocking=True)
+                        self.down_packed[j].copy_(self._h_dn_p[e], non_blocking=True)
+                        self.down_scale[j].copy_(self._h_dn_s[e], non_blocking=True)
+                    st = self._staged_idx
+                gu = dequant_gemv(x[t], self.gu_packed, self.gu_scale, st)   # [k, 2I]
+                g, u = gu.split(self.inter, dim=-1)
+                act = (F.silu(g) * u).to(x.dtype)                            # [k, I]
+                y = dequant_gemv(act, self.down_packed, self.down_scale, st) # [k, H]
+                outs.append((y.to(x.dtype) * w[t].unsqueeze(-1)).sum(dim=0))
+            return torch.stack(outs).view(shape)
 
         gu = self._dequant(self.gu_packed[sel], self.gu_scale[sel], self.hidden)
         h = torch.matmul(gu, x.view(T, 1, shape[-1], 1)).squeeze(-1)   # [T, k, 2I]

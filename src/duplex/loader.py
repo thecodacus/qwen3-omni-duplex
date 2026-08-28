@@ -77,8 +77,22 @@ def load_direct(model_path: str, device: str = "cuda", dtype=torch.bfloat16,
             except Exception:
                 c.quantization_config = None
 
-    log("building module tree on meta")
-    with torch.device("meta"):
+    # Parameters on meta, but BUFFERS COMPUTED NORMALLY. Seven tensors in this
+    # model are built in __init__ rather than stored in the checkpoint:
+    #   thinker.model.rotary_emb.inv_freq              (64)
+    #   talker.model.rotary_emb.inv_freq               (64)
+    #   talker.code_predictor.model.rotary_emb.inv_freq (64)
+    #   code2wav.pre_transformer.rotary_emb.inv_freq   (32)
+    #   code2wav.code_offset                        (1,16,1)
+    #   thinker.audio_tower..positional_embedding  (1500,1280)
+    #   thinker.visual.rotary_pos_emb.inv_freq         (18)
+    # A plain `torch.device("meta")` build leaves these on meta, and materialising
+    # them as zeros destroys the model silently: inv_freq = 0 gives every position
+    # an identical rotation, so the thinker emits "\n\n\n't\n\n\n". code_offset = 0
+    # makes every codebook read book 0.
+    log("building module tree (params on meta, buffers computed)")
+    from accelerate import init_empty_weights
+    with init_empty_weights(include_buffers=False):
         model = Qwen3OmniMoeForConditionalGeneration(cfg)
     if skip_vision and getattr(model.thinker, "visual", None) is not None:
         model.thinker.visual = None      # 0.5 GB this pipeline never touches
@@ -116,6 +130,11 @@ def load_direct(model_path: str, device: str = "cuda", dtype=torch.bfloat16,
     for name, t in list(model.named_parameters()) + list(model.named_buffers()):
         if not t.is_meta:
             continue
+        if "inv_freq" in name or "code_offset" in name or "positional_embedding" in name:
+            raise RuntimeError(
+                f"computed buffer {name} is still on meta — it would be zeroed, "
+                "which silently destroys the model. init_empty_weights should have "
+                "built it.")
         owner_name, _, attr = name.rpartition(".")
         mod = mods.get(owner_name)
         if mod is None:
