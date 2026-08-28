@@ -525,3 +525,66 @@ thinker. CUDA graphs and the pinned/streamed split are both untouched levers.
 
 The pattern across all three bugs: a component measured in kinder conditions than it
 runs in. That is what the loop was built to catch, and it caught three.
+
+## 20. Where the GPU engine's time actually goes
+
+`FastEngine` runs the full 48-layer model through transformers' `generate()` at
+**4.97 tok/s**, against ~40 tok/s for a comparable MoE in llama.cpp. Five attempts to
+close that, four of them null:
+
+| change | result |
+|---|---|
+| int8 talker (6.1 -> 3.0 GB) | free; enabled 8 pinned layers |
+| 8 pinned layers | +8% |
+| copy/compute overlap (down blob on a side stream) | **+15%** |
+| launch count halved (1280 -> 640 copies/token) | +1.5% |
+| removing the `sel.tolist()` device->host sync | +1.9% |
+| `torch.compile(reduce-overhead)` | crashed — CUDA graph output aliasing |
+| `torch.compile(default)` | **0%**, after 267 s of compilation |
+
+Four confident predictions, four ~0-2% results. So: profile.
+
+```
+BY CPU TIME (8 tokens)                    BY CUDA TIME
+  cudaMemcpyAsync  57.2%  1.893s  48,680    aten::copy_  45.0%  2.370s
+  cudaLaunchKernel  6.2%  0.206s  44,783
+  Command Buffer Full 4.4% 0.145s  1,491   <- driver queue saturating
+  aten::select      3.8%  0.124s 124,840
+  aten::as_strided  1.4%  0.045s 158,456
+```
+
+**6,085 memcpys and ~5,600 kernel launches per token** — I had predicted 640 from
+staging. The rest are incidental `.to()` / `.contiguous()` / indexing in the hot path,
+much of it in wrapper code written during this project. Nearly half of GPU time and
+two thirds of CPU time is spent copying, and `Command Buffer Full` shows the driver
+queue saturating: neither side is doing arithmetic.
+
+That also explains the null results. Halving launches removed 640 operations out of
+~11,700 per token — about 5% of the volume.
+
+### Numba, tested
+
+The llama.cpp `--n-cpu-moe` design (compute experts on the CPU, move 8 KB of
+activations instead of 21.3 MB of weights) failed earlier only because torch has no
+fast CPU int4 kernel. Numba is the obvious way to write one:
+
+```
+NUMBA one MoE layer (8 experts, CPU):  5.27 ms
+weight streaming, same layer:          1.575 ms
+                                       -> loses 3.3x
+```
+
+The inner loop is scalar nibble unpacking; Numba's auto-vectoriser will not produce
+the SIMD unpack llama.cpp hand-writes in AVX2 intrinsics. Bounded experiment, ten
+minutes, clear answer.
+
+### What this means
+
+The realtime claim does not depend on any of this. `clock-full` measured the *clock
+path* — Thinker[0:24] -> talker -> vocoder, raw forwards — at **77.16 ms p99.9 against
+an 80 ms budget**. `FastEngine` is the *background* model at full depth through
+`generate()`, which the profiler shows costs ~2.5x the raw forwards.
+
+The remaining lever with evidence behind it is a custom decode loop replacing
+`generate()`, worth roughly that 2.5x. Micro-optimisation is not: it has been tried
+five times for a combined ~25%, most of it from one change.

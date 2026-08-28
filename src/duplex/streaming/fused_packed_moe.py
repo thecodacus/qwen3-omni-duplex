@@ -32,6 +32,10 @@ from duplex.streaming.triton_dequant_gemv import dequant_gemv, HAVE_TRITON
 
 NUM_BITS = 4
 PACK = 32 // NUM_BITS      # 8 nibbles per int32
+
+import os
+_NOSYNC = os.environ.get("DUPLEX_NOSYNC") == "1"
+_FIXED_IDX = list(range(16))
 GROUP = 32
 
 
@@ -215,7 +219,10 @@ class FusedPackedMoE(nn.Module):
             for t in range(T):
                 st = sel[t]
                 if self.host_resident:
-                    idx = st.tolist()
+                    # NOSYNC=1 replaces the device->host sync with a constant index
+                    # list. Results are WRONG; this exists only to price the sync,
+                    # which is 40 pipeline drains per token and blocks CUDA graphs.
+                    idx = _FIXED_IDX[:self.top_k] if _NOSYNC else st.tolist()
                     gg, dg = self._grp
                     for j, e in enumerate(idx):          # needed immediately
                         gg["stage"][j].copy_(gg["host"][e], non_blocking=True)

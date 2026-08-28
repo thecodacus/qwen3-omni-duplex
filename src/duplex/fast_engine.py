@@ -33,12 +33,17 @@ class FastEngine:
 
     def __init__(self, model_path: str, speaker: str = "Ethan", n_pinned: int = 4,
                  cpu: bool = False, talker_q8: bool = True,
-                 cpu_moe: bool = False):
+                 cpu_moe: bool = False, compile_mode: str | None = None):
         self.model_path = model_path
         self.speaker = speaker
         self.n_pinned = n_pinned
         self.talker_q8 = talker_q8
         self.cpu_moe = cpu_moe
+        # Three micro-optimisations each landed at ~2% (launch count 1.5%, the
+        # device->host sync 1.9%). The remaining ~168 ms/token is diffuse Python
+        # dispatch across ~930 ops, which only disappears if the dispatch itself
+        # does. torch.compile("reduce-overhead") wraps CUDA graphs.
+        self.compile_mode = compile_mode
         self.model = None
         self.proc = None
         self.status = {"ready": False, "phase": "not started", "elapsed": 0.0,
@@ -152,6 +157,11 @@ class FastEngine:
         model = model.to(dev)
         torch.cuda.empty_cache()
 
+        if self.compile_mode:
+            self._set("compiling", f"torch.compile({self.compile_mode})")
+            model.thinker.model = torch.compile(model.thinker.model,
+                                                mode=self.compile_mode,
+                                                dynamic=False)
         self.torch = torch
         self.model = model
         self._set("processor", "tokenizer + feature extractor")
