@@ -30,11 +30,15 @@ def main(argv: list[str] | None = None) -> int:
                    add_help=False)
     sub.add_parser("speak", help="end-to-end speech via on-the-fly int4 dequant (offline quality gate)",
                    add_help=False)
+    sub.add_parser("probe", help="test whether the talker ALREADY quiets itself when told a user is speaking",
+                   add_help=False)
+    sub.add_parser("clock-full", help="the FULL clock path in one loop with real weights",
+                   add_help=False)
 
     # bench/thesis own the rest of the argv so their flags pass through untouched
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] in ("bench", "thesis", "vocoder", "stream-verify", "clock-real", "speak"):
+    if argv and argv[0] in ("bench", "thesis", "vocoder", "stream-verify", "clock-real", "speak", "probe", "clock-full"):
         cmd, rest = argv[0], argv[1:]
         sys.argv = [f"duplex {cmd}", *rest]
         if cmd == "bench":
@@ -47,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
             from duplex.streaming.talker import main as run
         elif cmd == "speak":
             from duplex.speak import main as run
+        elif cmd == "probe":
+            from duplex.probe import main as run
+        elif cmd == "clock-full":
+            from duplex.streaming.clock import main as run
         else:
             from duplex.thesis.vocoder import main as run
         run()

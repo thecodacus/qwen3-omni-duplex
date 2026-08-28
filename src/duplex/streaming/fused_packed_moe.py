@@ -65,24 +65,57 @@ def _stack_packed(linears, dtype, device):
 class FusedPackedMoE(nn.Module):
     """SparseMoeBlock replacement for int4-packed experts."""
 
-    def __init__(self, block: nn.Module, dtype=torch.bfloat16, device="cuda"):
+    def __init__(self, block: nn.Module, dtype=torch.bfloat16, device="cuda",
+                 host_resident: bool = False):
+        """`host_resident` keeps the packed experts in pinned host RAM and copies
+        only the selected ones to a GPU staging buffer per token.
+
+        Measured cost of that choice, per layer: 0.639 ms resident vs 1.575 ms
+        streamed, against 0.316 GB vs 0.022 GB. Neither extreme fits a 12 GB card
+        alongside the talker (24 pinned = 8.4 GB) nor the 80 ms budget (24 streamed
+        = 37.8 ms), so layers are split between the two. See docs/design.md §13.
+        """
         super().__init__()
+        self.host_resident = host_resident
         experts = block.experts
         self.num_experts = len(experts)
         self.top_k = block.top_k
         self.norm_topk_prob = getattr(block, "norm_topk_prob", True)
         self.gate = block.gate.to(device=device, dtype=dtype)
 
-        gp, gs, inter, hidden = _stack_packed([e.gate_proj for e in experts], dtype, device)
-        up, us, _, _ = _stack_packed([e.up_proj for e in experts], dtype, device)
-        dp, ds, hid_out, inter_in = _stack_packed([e.down_proj for e in experts], dtype, device)
+        # Stack straight onto the destination. Building on the GPU and then moving
+        # to host would spike device memory for every host-resident layer.
+        build = "cpu" if host_resident else device
+        gp, gs, inter, hidden = _stack_packed([e.gate_proj for e in experts], dtype, build)
+        up, us, _, _ = _stack_packed([e.up_proj for e in experts], dtype, build)
+        dp, ds, hid_out, inter_in = _stack_packed([e.down_proj for e in experts], dtype, build)
 
         # gate and up share a shape, so concatenate along out_features for one gather
-        self.register_buffer("gu_packed", torch.cat([gp, up], dim=1), persistent=False)
-        self.register_buffer("gu_scale", torch.cat([gs, us], dim=1), persistent=False)
-        self.register_buffer("down_packed", dp, persistent=False)
-        self.register_buffer("down_scale", ds, persistent=False)
-        del gp, up, gs, us, dp, ds
+        gu_p, gu_s = torch.cat([gp, up], dim=1), torch.cat([gs, us], dim=1)
+        del gp, up, gs, us
+
+        if host_resident:
+            # pinned host storage + preallocated device staging for top_k experts
+            self._h_gu_p = gu_p.pin_memory()
+            self._h_gu_s = gu_s.pin_memory()
+            self._h_dn_p = dp.pin_memory()
+            self._h_dn_s = ds.pin_memory()
+            k = self.top_k
+            self.register_buffer("gu_packed", torch.empty(k, *gu_p.shape[1:],
+                                 dtype=gu_p.dtype, device=device), persistent=False)
+            self.register_buffer("gu_scale", torch.empty(k, *gu_s.shape[1:],
+                                 dtype=gu_s.dtype, device=device), persistent=False)
+            self.register_buffer("down_packed", torch.empty(k, *dp.shape[1:],
+                                 dtype=dp.dtype, device=device), persistent=False)
+            self.register_buffer("down_scale", torch.empty(k, *ds.shape[1:],
+                                 dtype=ds.dtype, device=device), persistent=False)
+            del gu_p, gu_s, dp, ds
+        else:
+            self.register_buffer("gu_packed", gu_p, persistent=False)
+            self.register_buffer("gu_scale", gu_s, persistent=False)
+            self.register_buffer("down_packed", dp, persistent=False)
+            self.register_buffer("down_scale", ds, persistent=False)
+            del gu_p, gu_s, dp, ds
 
         self.inter = inter
         self.hidden = hidden
@@ -108,6 +141,17 @@ class FusedPackedMoE(nn.Module):
         w = w.to(x.dtype)
         T, k = sel.shape
 
+        if self.host_resident:
+            # Stage only the chosen experts. Each expert slice is contiguous, so
+            # this is k async copies per tensor rather than a host-side gather.
+            idx = sel[0].tolist()
+            for j, e in enumerate(idx):
+                self.gu_packed[j].copy_(self._h_gu_p[e], non_blocking=True)
+                self.gu_scale[j].copy_(self._h_gu_s[e], non_blocking=True)
+                self.down_packed[j].copy_(self._h_dn_p[e], non_blocking=True)
+                self.down_scale[j].copy_(self._h_dn_s[e], non_blocking=True)
+            sel = torch.arange(k, device=sel.device, dtype=sel.dtype).unsqueeze(0)
+
         gu = self._dequant(self.gu_packed[sel], self.gu_scale[sel], self.hidden)
         h = torch.matmul(gu, x.view(T, 1, shape[-1], 1)).squeeze(-1)   # [T, k, 2I]
         del gu
@@ -122,6 +166,7 @@ class FusedPackedMoE(nn.Module):
 
 
 def fuse_packed_moe_blocks(model, dtype=torch.bfloat16, device="cuda",
+                           n_pinned: int | None = None,
                            verbose: bool = True) -> int:
     """Replace every packed SparseMoeBlock with a FusedPackedMoE.
 
@@ -139,7 +184,10 @@ def fuse_packed_moe_blocks(model, dtype=torch.bfloat16, device="cuda",
     n = 0
     for parent, name in sites:
         child = getattr(parent, name)
-        setattr(parent, name, FusedPackedMoE(child, dtype, device))
+        # partial residency: the first n_pinned blocks live on the GPU, the rest
+        # stream their selected experts from pinned host RAM per token.
+        host = n_pinned is not None and n >= n_pinned
+        setattr(parent, name, FusedPackedMoE(child, dtype, device, host_resident=host))
         child.experts = None
         del child
         gc.collect()
@@ -151,5 +199,9 @@ def fuse_packed_moe_blocks(model, dtype=torch.bfloat16, device="cuda",
             print(f"    fused {n}/{len(sites)} packed blocks, {used:.2f} GB", flush=True)
 
     if verbose:
-        print(f"fused {n} packed MoE blocks (int4 gather+unpack+bmm)")
+        if n_pinned is None:
+            print(f"fused {n} packed MoE blocks, all GPU-resident")
+        else:
+            print(f"fused {n} packed MoE blocks: {min(n_pinned, n)} pinned, "
+                  f"{max(0, n - n_pinned)} streamed from host")
     return n
