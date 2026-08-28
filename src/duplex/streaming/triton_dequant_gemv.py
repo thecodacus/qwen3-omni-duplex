@@ -113,3 +113,53 @@ def reference_gemv(x, packed, scale, sel, group=32):
     K = x.numel()
     w = FusedPackedMoE._dequant(packed[sel], scale[sel].to(torch.float32), K)
     return torch.matmul(w, x.to(torch.float32).view(-1, 1)).squeeze(-1)
+
+
+class TritonPackedLinear(torch.nn.Module):
+    """A packed int4 Linear whose forward uses the dequant-GEMV kernel.
+
+    Attention was originally left on the torch dequant path with the note "4
+    linears/layer, ~7 MB packed each -- not worth a kernel yet". That sized it by
+    *packed* bytes; the cost is set by *dequantized* work. q and o are 4096x2048, so
+    attention is 452M params/token materialized to dense across 96 calls, and it
+    measured at ~215 ms of the Thinker's 230 ms.
+
+    A plain Linear is the E=1 case of the expert gather, so the same kernel serves.
+    """
+
+    def __init__(self, mod, device="cuda"):
+        super().__init__()
+        shape = tuple(int(x) for x in mod.weight_shape.tolist())
+        self.out_features, self.in_features = shape
+        self.register_buffer("packed", mod.weight_packed.to(device).unsqueeze(0),
+                             persistent=False)
+        self.register_buffer("scale", mod.weight_scale.to(device).float().unsqueeze(0),
+                             persistent=False)
+        b = getattr(mod, "bias", None)
+        self.register_buffer("bias", b.to(device) if b is not None else None,
+                             persistent=False)
+        self.register_buffer("_sel", torch.zeros(1, dtype=torch.int32, device=device),
+                             persistent=False)
+
+    def forward(self, x):
+        lead, K = x.shape[:-1], x.shape[-1]
+        flat = x.reshape(-1, K)
+        outs = [dequant_gemv(flat[i], self.packed, self.scale, self._sel)[0]
+                for i in range(flat.shape[0])]
+        y = torch.stack(outs).to(x.dtype)
+        if self.bias is not None:
+            y = y + self.bias
+        return y.view(*lead, self.out_features)
+
+
+def patch_attention_to_triton(model, device="cuda", verbose=True) -> int:
+    """Swap packed attention projections onto the Triton kernel."""
+    n = 0
+    for parent in model.modules():
+        for name, child in list(parent.named_children()):
+            if hasattr(child, "weight_packed") and hasattr(child, "weight_scale"):
+                setattr(parent, name, TritonPackedLinear(child, device))
+                n += 1
+    if verbose:
+        print(f"moved {n} packed linears onto the Triton kernel")
+    return n

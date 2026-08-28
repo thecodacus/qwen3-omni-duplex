@@ -125,10 +125,13 @@ def main():
     th, tcfg, n_packed = load_thinker_prefix(a.model, a.layers, dev, dtype)
     print(f"  {n_packed} packed linears, {time.time()-t0:.0f}s", flush=True)
 
-    # MoE via the Triton dequant-GEMV; attention via the torch dequant path
-    # (4 linears/layer, ~7 MB packed each -- not worth a kernel yet).
+    # MoE first (it consumes the expert modules), then whatever packed linears
+    # remain -- the attention projections. Both go on the Triton kernel: leaving
+    # attention on the torch dequant path cost ~215 ms of a 230 ms thinker, because
+    # q/o are 4096x2048 and get materialized to dense 96 times per token.
     fuse_packed_moe_blocks(th, dtype=dtype, device=dev, n_pinned=a.pinned)
-    patch_packed_linears(th, compute_device=dev, verbose=False)
+    from duplex.streaming.triton_dequant_gemv import patch_attention_to_triton
+    patch_attention_to_triton(th, device=dev)
     # .to(dev) must not drag the host-resident experts onto the card; they are held
     # as plain attributes rather than buffers precisely so this leaves them alone.
     th = th.to(dev).eval()
