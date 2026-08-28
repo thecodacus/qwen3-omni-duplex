@@ -48,7 +48,8 @@ Chronological log of findings and wrong turns: [`JOURNEY.md`](JOURNEY.md).
 - [x] llama.cpp turns out **not** to be required — the dividing line was in-memory vs in-register
       dequantization, not framework
 - [ ] Wire the clock path into one running loop
-- [ ] Silence-frame semantics (`codec_nothink_id` already exists in the codec vocab)
+- [ ] Silence-frame semantics — no existing mechanism; the codec special tokens are a
+      one-shot mode/voice preamble, not per-frame control (see `docs/design.md` §2)
 - [ ] Dual-channel training for interrupt/backchannel behaviour
 
 ## Usage

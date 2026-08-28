@@ -63,8 +63,13 @@ Thinker's depth.
 Three more things already present:
 - `_get_talker_user_parts()` projects the **user's audio** into the Talker. A listen
   channel exists; it is just fed the whole turn retrospectively.
-- The codec vocabulary already has `codec_nothink_id: 2155`, `codec_think_bos_id`,
-  `codec_pad_id` — a latent hold mechanism.
+- ~~The codec vocabulary already has `codec_nothink_id` — a latent hold mechanism.~~
+  **Wrong, corrected later.** Those tokens are a fixed 6-token preamble
+  (`nothink, think_bos, think_eos, speaker, pad, bos`) prepended once — a mode-and-voice
+  header, not a per-frame silence mechanism. They are ids 2148-2157 against a
+  `codebook_size` of 2048, so they are outside the audio codebook and cannot decode to
+  sound. Inferred from token names without reading the usage, then repeated in four
+  documents before being checked.
 - Half-duplex is **orchestration**: `thinker.generate()` runs to completion, and only
   then does the Talker run. The conditioning itself is per-token.
 
@@ -322,7 +327,7 @@ against a symptom created by the grep.
 ## 15. What remains
 
 - Wire the clock path into one loop — the pieces are benchmarked separately, not yet run together.
-- Silence-frame semantics: `codec_nothink_id` exists, but the model was never trained to emit "nothing" as a positive action.
+- Silence-frame semantics. There is **no** existing mechanism — see the correction in section 3. Silence must be ordinary codec tokens decoding to near-zero audio, and must be learned.
 - Dual-channel conversation data (Fisher-style) for interrupt and backchannel timing. No amount of engineering recovers this; it is the honest ceiling on doing this solo.
 
 ## Numbers worth keeping

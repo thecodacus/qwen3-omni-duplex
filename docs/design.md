@@ -57,8 +57,25 @@ Talker: multimodal (audio) positions through `hidden_projection` of layer-24 hid
 through `text_projection` of embeddings. The Talker already ingests user audio — it is simply fed
 the whole turn retrospectively rather than frame by frame.
 
-**Silence tokens already exist.** The codec vocabulary carries `codec_nothink_id: 2155`,
-`codec_think_bos_id`, `codec_think_eos_id`, `codec_pad_id` — a latent hold mechanism.
+**No silence mechanism exists — an earlier claim here was wrong.** The codec vocabulary
+carries `codec_nothink_id: 2155`, `codec_think_bos_id`, `codec_think_eos_id`,
+`codec_pad_id`, and this document previously called that "a latent hold mechanism". It
+is not. They are used in exactly one place, as a fixed 6-token preamble prepended once
+to the Talker's codec stream:
+
+```python
+codec_special_tokens = [[codec_nothink_id, codec_think_bos_id, codec_think_eos_id,
+                        speaker_id, codec_pad_id, codec_bos_id]]
+```
+
+Read in order that is a mode-and-voice header — no-thinking, empty think span, which
+voice, pad, begin — the codec-stream analogue of Qwen3's `/no_think`. It appears at
+position 0 and is never emitted during generation. `codebook_size` is 2048 and these ids
+are 2148-2157, **outside the audio codebook**, so they cannot decode to sound at all.
+
+The Talker therefore has no way to emit *nothing* for a frame. Silence would have to be
+ordinary codec tokens decoding to near-zero audio — learnable, but nothing in the
+checkpoint indicates it was learned.
 
 **Half-duplex is orchestration, not architecture.** The reference `generate()` does:
 
