@@ -588,3 +588,29 @@ an 80 ms budget**. `FastEngine` is the *background* model at full depth through
 The remaining lever with evidence behind it is a custom decode loop replacing
 `generate()`, worth roughly that 2.5x. Micro-optimisation is not: it has been tried
 five times for a combined ~25%, most of it from one change.
+
+
+## 21. The passing result stopped reproducing
+
+Section 19's PASS (77.16 ms p99.9) was measured against code that no longer existed.
+The staging optimisations in section 20 changed `fuse_packed_moe_blocks` underneath
+it. Re-running:
+
+|  | mean | p99.9 | vocoder p99.9 | |
+|---|---|---|---|---|
+| overlap ON | 69.10 | **120.95** | 63.01 | FAIL, 1/150 over |
+| overlap OFF | 72.81 | **77.24** | 13.96 | PASS, 0/150 over |
+
+The copy/compute overlap buys 5% on the mean and costs 57% on p99.9 — and the damage
+lands on the **vocoder**, a stage it does not touch. The side stream and its events
+stall unrelated work in the same loop.
+
+This is the third time in this project that an optimisation improved the average and
+destroyed the tail: `expandable_segments:True` (+68 ms p99.9 to an untouched stage),
+the vocoder's growing `DynamicCache`, and now this. Deadline workloads and throughput
+workloads want opposite things, and a benchmark that reports only a mean will not
+show it.
+
+Overlap now defaults OFF; `DUPLEX_OVERLAP=1` re-enables it for throughput paths.
+
+The clock path passes again at **77.24 ms p99.9**, reproducing the original 77.16.

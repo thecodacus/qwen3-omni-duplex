@@ -35,6 +35,18 @@ PACK = 32 // NUM_BITS      # 8 nibbles per int32
 
 import os
 _NOSYNC = os.environ.get("DUPLEX_NOSYNC") == "1"
+# Copy/compute overlap helps the MEAN and wrecks the TAIL. Measured on the clock
+# path, identical code otherwise:
+#
+#            mean     p99.9    vocoder p99.9   verdict
+#   ON      69.10    120.95        63.01       FAIL
+#   OFF     72.81     77.24        13.96       PASS
+#
+# The side stream and its events stall the vocoder -- a stage the overlap does not
+# touch -- exactly as PYTORCH_CUDA_ALLOC_CONF=expandable_segments did earlier.
+# Deadline work is judged on p99.9, so this defaults OFF. Throughput paths that
+# care about the mean can set DUPLEX_OVERLAP=1.
+_OVERLAP = os.environ.get("DUPLEX_OVERLAP", "0") == "1"
 _FIXED_IDX = list(range(16))
 GROUP = 32
 
@@ -226,12 +238,16 @@ class FusedPackedMoE(nn.Module):
                     gg, dg = self._grp
                     for j, e in enumerate(idx):          # needed immediately
                         gg["stage"][j].copy_(gg["host"][e], non_blocking=True)
-                    cur = torch.cuda.current_stream()
-                    self._cp_stream.wait_stream(cur)
-                    with torch.cuda.stream(self._cp_stream):
-                        for j, e in enumerate(idx):      # overlaps gate_up below
+                    if _OVERLAP:
+                        cur = torch.cuda.current_stream()
+                        self._cp_stream.wait_stream(cur)
+                        with torch.cuda.stream(self._cp_stream):
+                            for j, e in enumerate(idx):  # overlaps gate_up below
+                                dg["stage"][j].copy_(dg["host"][e], non_blocking=True)
+                            self._down_ready.record(self._cp_stream)
+                    else:
+                        for j, e in enumerate(idx):
                             dg["stage"][j].copy_(dg["host"][e], non_blocking=True)
-                        self._down_ready.record(self._cp_stream)
                     gu_p_v, gu_s_v = self._views(gg)
                     dn_p_v, dn_s_v = self._views(dg)
                     st = self._staged_idx
@@ -239,7 +255,7 @@ class FusedPackedMoE(nn.Module):
                 gu = dequant_gemv(x[t], gp_, gs_, st)                        # [k, 2I]
                 g, u = gu.split(self.inter, dim=-1)
                 act = (F.silu(g) * u).to(x.dtype)                            # [k, I]
-                if self.host_resident:
+                if self.host_resident and _OVERLAP:
                     torch.cuda.current_stream().wait_event(self._down_ready)
                 dp_, ds_ = (dn_p_v, dn_s_v) if self.host_resident else (self.down_packed, self.down_scale)
                 y = dequant_gemv(act, dp_, ds_, st)                          # [k, H]
