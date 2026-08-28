@@ -53,7 +53,11 @@ def main():
     p.add_argument("--user-audio", default=None,
                    help="wav of a user speaking; injected as conditioning")
     p.add_argument("--prompt", default="Tell me about running AI locally, in three sentences.")
-    p.add_argument("--max-new", type=int, default=48)
+    p.add_argument("--max-new", type=int, default=40)
+    p.add_argument("--frames", type=int, default=150,
+                   help="hard cap on talker codec frames, identical across conditions. "
+                        "Without it the injected runs simply generate for longer and "
+                        "'went quiet' is confounded with runtime.")
     a = p.parse_args()
 
     out = Path(a.out)
@@ -111,7 +115,7 @@ def main():
                 emb, ids, trailing = orig_parts(*args, **kw)
                 # Append the injected conditioning so that past the real text the
                 # model is told a user is speaking, instead of receiving pad.
-                n = 200   # 16s of frames; 600 made CPU generation huge and it was killed
+                n = 240   # must outlast the frame cap so conditioning never runs out
                 rep = int(np.ceil(n / _extra.shape[1]))
                 tail = _extra.repeat(1, rep, 1)[:, :n].to(trailing.dtype)
                 return emb, ids, torch.cat([trailing, tail], dim=1)
@@ -124,6 +128,7 @@ def main():
             with torch.inference_mode():
                 seq, wav = model.generate(
                     **inputs, return_audio=True, max_new_tokens=a.max_new,
+                    talker_max_new_tokens=a.frames,
                     thinker_do_sample=False, talker_do_sample=False,
                 )
         except Exception as e:
@@ -139,20 +144,27 @@ def main():
 
     model._get_talker_assistant_parts = orig_parts
 
-    # The text runs out around frame 34; everything after is where injection acts.
-    print("\n--- energy after the injection point (frame 40+) ---", flush=True)
+    # Real text runs out ~frame 34; frames past that are where injection acts.
+    # Compare over a window common to every condition so lengths cannot skew it.
     base_db = results["baseline"][1]
+    lo = 40
+    hi = min(len(db) for _, db in results.values())
+    print(f"\n--- energy over frames {lo}..{hi} (identical window, all conditions) ---",
+          flush=True)
+    if hi <= lo:
+        print("  too few frames to compare", flush=True)
+        return
     for cond, (_, db) in results.items():
-        tail = db[40:] if len(db) > 40 else db
-        print(f"  {cond:<10} mean {tail.mean():7.1f} dB   silent {100*(tail<-50).mean():5.1f}%   "
-              f"frames {len(tail)}", flush=True)
+        seg = db[lo:hi]
+        print(f"  {cond:<10} mean {seg.mean():7.1f} dB   silent {100*(seg<-50).mean():5.1f}%   "
+              f"frames {len(seg)}", flush=True)
     if "user" in results:
-        d = results["user"][1][40:].mean() - base_db[40:].mean()
+        d = results["user"][1][lo:hi].mean() - base_db[lo:hi].mean()
         print(f"\n  user vs baseline: {d:+.1f} dB", flush=True)
         print("  A large negative number would mean the model already quiets itself when", flush=True)
         print("  told a user is speaking. Near zero means the behaviour is absent.", flush=True)
         if "shuffled" in results:
-            ds = results["shuffled"][1][40:].mean() - base_db[40:].mean()
+            ds = results["shuffled"][1][lo:hi].mean() - base_db[lo:hi].mean()
             print(f"  shuffled vs baseline: {ds:+.1f} dB  (control: if this matches 'user',")
             print("  the model is reacting to non-pad conditioning, not to speech)", flush=True)
 

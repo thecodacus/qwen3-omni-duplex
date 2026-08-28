@@ -420,3 +420,45 @@ someone else is speaking), not *representation*.
 
 This corrects a claim repeated throughout the project that dual-channel data was an
 immovable blocker. It is neither immovable nor, apparently, expensive.
+
+## 18. Testing the assumption: is duplex behaviour already latent?
+
+The whole project assumed Qwen3-Omni cannot do duplex without training. That was
+never tested, and testing it is cheap.
+
+The Talker takes one conditioning vector per frame:
+
+```python
+if generation_step < trailing_text_hidden.shape[1]:
+    inputs_embeds += trailing_text_hidden[:, generation_step]
+else:
+    inputs_embeds += tts_pad_embed
+```
+
+Real text runs out around frame 34, so extending `trailing_text_hidden` with the
+user's audio hiddens — through the Talker's own `hidden_projection`, the same path
+`_get_talker_user_parts` uses — tells the model "a user is speaking" at every frame
+past that point. No code change, no training.
+
+Three conditions, same prompt, same seed, **the same 150-frame cap** so length cannot
+be confused with quietness:
+
+| | mean | silent | vs baseline |
+|---|---|---|---|
+| baseline (pad) | −31.9 dB | 13.0% | — |
+| user hiddens | −38.0 dB | 20.4% | **−6.1 dB** |
+| **shuffled hiddens** | **−39.6 dB** | **25.0%** | **−7.7 dB** |
+
+**No latent duplex.** The model does quiet down under injected conditioning, but
+*time-shuffled* conditioning suppresses it slightly **more** than real speech. It is
+reacting to "this is not the pad embedding I expect", not to the content. Duplex
+behaviour must be trained.
+
+The `shuffled` arm is the entire result. Without it, −6.1 dB and 20.4% silence would
+have looked like a discovery.
+
+Two process notes: the first two attempts of this probe were unreadable. One died
+when the host rebooted mid-run (silently — no traceback, initially misattributed to
+print buffering). The second had no frame cap, so the injected condition simply
+generated for 42 minutes against baseline's 6, making "went quiet" indistinguishable
+from "ran longer".
