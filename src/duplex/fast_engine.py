@@ -32,10 +32,13 @@ class FastEngine:
     """Drop-in replacement for duplex.server.Engine, on the GPU."""
 
     def __init__(self, model_path: str, speaker: str = "Ethan", n_pinned: int = 4,
-                 cpu: bool = False):
+                 cpu: bool = False, talker_q8: bool = True,
+                 cpu_moe: bool = False):
         self.model_path = model_path
         self.speaker = speaker
         self.n_pinned = n_pinned
+        self.talker_q8 = talker_q8
+        self.cpu_moe = cpu_moe
         self.model = None
         self.proc = None
         self.status = {"ready": False, "phase": "not started", "elapsed": 0.0,
@@ -65,6 +68,41 @@ class FastEngine:
                                detail=f"{type(e).__name__}: {e}")
 
     # ---- load ---------------------------------------------------------------
+    def _talker_cache_path(self):
+        from pathlib import Path
+        return Path(self.model_path) / "talker_q8_fused.safetensors"
+
+    def _save_talker_cache(self, talker):
+        """Persist the fused+quantised talker so restarts skip the work."""
+        from safetensors.torch import save_file
+        sd = {}
+        for name, mod in talker.named_modules():
+            if type(mod).__name__ == "FusedMoE":
+                for attr in ("gate_up", "down", "gate_up_s", "down_s"):
+                    t = getattr(mod, attr, None)
+                    if t is not None:
+                        sd[f"{name}.{attr}"] = t.cpu()
+        if sd:
+            save_file(sd, str(self._talker_cache_path()))
+        return len(sd)
+
+    def _load_talker_cache(self, talker, device):
+        from safetensors.torch import load_file
+        path = self._talker_cache_path()
+        if not path.exists():
+            return 0
+        blob = load_file(str(path))
+        mods = dict(talker.named_modules())
+        n = 0
+        for k, v in blob.items():
+            owner, _, attr = k.rpartition(".")
+            m = mods.get(owner)
+            if m is None:
+                return 0                      # stale cache, fall back to quantising
+            m.register_buffer(attr, v.to(device), persistent=False)
+            n += 1
+        return n
+
     def load(self, log=print):
         from transformers import Qwen3OmniMoeProcessor
         from duplex.loader import load_direct
@@ -88,13 +126,27 @@ class FastEngine:
         self._set("fusing thinker MoE",
                   f"{self.n_pinned} layers pinned, rest streamed from host")
         fuse_packed_moe_blocks(th.model, dtype=dtype, device=dev,
-                               n_pinned=self.n_pinned, verbose=False)
+                               n_pinned=self.n_pinned, cpu_compute=self.cpu_moe,
+                               verbose=False)
 
         self._set("attention -> Triton", "packed projections onto the kernel")
         patch_attention_to_triton(th, device=dev, verbose=False)
 
-        self._set("fusing talker MoE", "gather+bmm, replacing the python expert loop")
-        fuse_moe_blocks(model.talker, verbose=False)
+        cached = 0
+        if self.talker_q8 and self._talker_cache_path().exists():
+            # Structure first (cheap, stacks then throws the result away), then
+            # overwrite with the cached int8 tensors.
+            self._set("fusing talker MoE", "restoring int8 from disk cache")
+            fuse_moe_blocks(model.talker, q8=True, verbose=False)
+            cached = self._load_talker_cache(model.talker, "cpu")
+        if not cached:
+            self._set("fusing talker MoE",
+                      "gather+bmm" + (", int8 (6.1 -> ~3.0 GB)" if self.talker_q8 else ""))
+            fuse_moe_blocks(model.talker, q8=self.talker_q8, verbose=False)
+            if self.talker_q8:
+                self._set("caching talker", "writing int8 to disk for next start")
+                n = self._save_talker_cache(model.talker)
+                log(f"cached {n} talker tensors to {self._talker_cache_path().name}")
 
         self._set("placing on GPU", "everything must report as a GPU module")
         model = model.to(dev)

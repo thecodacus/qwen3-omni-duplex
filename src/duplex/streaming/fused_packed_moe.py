@@ -68,7 +68,7 @@ class FusedPackedMoE(nn.Module):
     """SparseMoeBlock replacement for int4-packed experts."""
 
     def __init__(self, block: nn.Module, dtype=torch.bfloat16, device="cuda",
-                 host_resident: bool = False):
+                 host_resident: bool = False, cpu_compute: bool = False):
         """`host_resident` keeps the packed experts in pinned host RAM and copies
         only the selected ones to a GPU staging buffer per token.
 
@@ -79,6 +79,16 @@ class FusedPackedMoE(nn.Module):
         """
         super().__init__()
         self.host_resident = host_resident
+        # llama.cpp's --n-cpu-moe: compute non-resident experts ON the CPU and send
+        # only activations over PCIe. Weight streaming moves 21.3 MB/layer; an
+        # activation is 4 KB each way -- ~2600x less traffic, no per-expert copies
+        # (1280 launches/token), no sel.tolist() sync per layer.
+        #
+        # OFF by default. The architecture is right but the implementation is not
+        # competitive here: llama.cpp wins this with hand-written AVX2/AVX512 int4
+        # kernels, and dequantising with generic torch ops on the CPU was far slower
+        # than streaming the weights. Worth revisiting with a real CPU kernel.
+        self.cpu_compute = cpu_compute and host_resident
         experts = block.experts
         self.num_experts = len(experts)
         self.top_k = block.top_k
@@ -96,7 +106,12 @@ class FusedPackedMoE(nn.Module):
         gu_p, gu_s = torch.cat([gp, up], dim=1), torch.cat([gs, us], dim=1)
         del gp, up, gs, us
 
-        if host_resident:
+        if cpu_compute and host_resident:
+            # Weights live on the CPU and stay there; nothing is staged to the GPU.
+            self._h_gu_p, self._h_gu_s = gu_p, gu_s
+            self._h_dn_p, self._h_dn_s = dp, ds
+            del gu_p, gu_s, dp, ds
+        elif host_resident:
             # pinned host storage + preallocated device staging for top_k experts
             self._h_gu_p = gu_p.pin_memory()
             self._h_gu_s = gu_s.pin_memory()
@@ -146,6 +161,26 @@ class FusedPackedMoE(nn.Module):
         w = w.to(x.dtype)
         T, k = sel.shape
 
+        if self.cpu_compute:
+            # Route on whichever device the gate ended up on (model.to(dev) moves it
+            # back to the GPU regardless of what __init__ did), then send only the
+            # activation to the CPU. That is 4 KB each way per layer against
+            # 21.3 MB of weights.
+            dev_in = x.device
+            xc = x.to("cpu", torch.float32)
+            wc, selc = w.to("cpu", torch.float32), sel.to("cpu")
+            outs = []
+            for t in range(T):
+                st = selc[t]
+                gu = self._dequant(self._h_gu_p[st], self._h_gu_s[st].float(), self.hidden)
+                h = torch.matmul(gu, xc[t].view(-1, 1)).squeeze(-1)      # [k, 2I]
+                g, u = h.split(self.inter, dim=-1)
+                act = (F.silu(g) * u).unsqueeze(-1)                      # [k, I, 1]
+                dn = self._dequant(self._h_dn_p[st], self._h_dn_s[st].float(), self.inter_in)
+                y = torch.matmul(dn, act).squeeze(-1)                    # [k, H]
+                outs.append((y * wc[t].unsqueeze(-1)).sum(dim=0))
+            return torch.stack(outs).to(dev_in, hidden_states.dtype).view(shape)
+
         if HAVE_TRITON:
             # One token at a time. Prefill passes T>1, and the torch path below
             # would materialise [T, k, 2I, H] dense weights for it -- measured at
@@ -185,7 +220,7 @@ class FusedPackedMoE(nn.Module):
 
 
 def fuse_packed_moe_blocks(model, dtype=torch.bfloat16, device="cuda",
-                           n_pinned: int | None = None,
+                           n_pinned: int | None = None, cpu_compute: bool = False,
                            verbose: bool = True) -> int:
     """Replace every packed SparseMoeBlock with a FusedPackedMoE.
 
@@ -206,7 +241,8 @@ def fuse_packed_moe_blocks(model, dtype=torch.bfloat16, device="cuda",
         # partial residency: the first n_pinned blocks live on the GPU, the rest
         # stream their selected experts from pinned host RAM per token.
         host = n_pinned is not None and n >= n_pinned
-        setattr(parent, name, FusedPackedMoE(child, dtype, device, host_resident=host))
+        setattr(parent, name, FusedPackedMoE(child, dtype, device, host_resident=host,
+                                            cpu_compute=cpu_compute))
         child.experts = None
         del child
         gc.collect()
@@ -221,6 +257,7 @@ def fuse_packed_moe_blocks(model, dtype=torch.bfloat16, device="cuda",
         if n_pinned is None:
             print(f"fused {n} packed MoE blocks, all GPU-resident")
         else:
+            mode = "computed on CPU" if cpu_compute else "streamed from host"
             print(f"fused {n} packed MoE blocks: {min(n_pinned, n)} pinned, "
-                  f"{max(0, n - n_pinned)} streamed from host")
+                  f"{max(0, n - n_pinned)} {mode}")
     return n

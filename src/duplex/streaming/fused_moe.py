@@ -40,8 +40,17 @@ import torch.nn.functional as F
 class FusedMoE(nn.Module):
     """Drop-in replacement for a SparseMoeBlock, with experts stacked."""
 
-    def __init__(self, block: nn.Module):
+    def __init__(self, block: nn.Module, chunk: int = 8, q8: bool = False):
+        """`q8` stores the stacked experts as per-output-channel symmetric int8.
+
+        The talker ships bf16 in this checkpoint and is 6.1 GB — the largest single
+        item on the card, and the reason the full model leaves no room for
+        activations. int8 halves it to ~3.0 GB. Far less aggressive than the int4
+        already running on the thinker, and dequantization is one multiply.
+        """
         super().__init__()
+        self.chunk = chunk
+        self.q8 = q8
         experts = block.experts
         e0 = experts[0]
         self.num_experts = len(experts)
@@ -60,8 +69,20 @@ class FusedMoE(nn.Module):
             gate_up[i, :inter] = e.gate_proj.weight
             gate_up[i, inter:] = e.up_proj.weight
             down[i] = e.down_proj.weight
-        self.register_buffer("gate_up", gate_up, persistent=False)
-        self.register_buffer("down", down, persistent=False)
+        if q8:
+            # symmetric per-output-channel: scale over the input dim
+            gu_s = gate_up.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+            dn_s = down.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+            gu_q = (gate_up / gu_s).round().clamp_(-127, 127).to(torch.int8)
+            dn_q = (down / dn_s).round().clamp_(-127, 127).to(torch.int8)
+            del gate_up, down
+            self.register_buffer("gate_up", gu_q, persistent=False)
+            self.register_buffer("down", dn_q, persistent=False)
+            self.register_buffer("gate_up_s", gu_s.to(dtype), persistent=False)
+            self.register_buffer("down_s", dn_s.to(dtype), persistent=False)
+        else:
+            self.register_buffer("gate_up", gate_up, persistent=False)
+            self.register_buffer("down", down, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shape = hidden_states.shape
@@ -74,19 +95,34 @@ class FusedMoE(nn.Module):
             w = w / w.sum(dim=-1, keepdim=True)
         w = w.to(x.dtype)
 
-        gu = self.gate_up[sel]                                     # [T, k, 2I, H]
-        dn = self.down[sel]                                        # [T, k, H, I]
         T, k = sel.shape
 
-        h = torch.matmul(gu, x.view(T, 1, shape[-1], 1)).squeeze(-1)   # [T, k, 2I]
-        g, u = h.split(self.inter, dim=-1)
-        act = (F.silu(g) * u).unsqueeze(-1)                            # [T, k, I, 1]
-        y = torch.matmul(dn, act).squeeze(-1)                          # [T, k, H]
-        y = (y * w.unsqueeze(-1)).sum(dim=1)                           # [T, H]
-        return y.view(shape)
+        # Chunk over tokens. The gather is [T, k, 2I, H] + [T, k, H, I], which for
+        # a prefill of any length is hundreds of MB — measured OOM at 306 MB for
+        # `self.down[sel]` alone. Chunking bounds it while keeping the batched
+        # matmul that made this fast in the first place.
+        chunk = self.chunk if T > self.chunk else T
+        outs = []
+        for i in range(0, T, chunk):
+            xs, ss, ws = x[i:i + chunk], sel[i:i + chunk], w[i:i + chunk]
+            t = xs.shape[0]
+            gu = self.gate_up[ss]                                      # [t, k, 2I, H]
+            if self.q8:
+                gu = gu.to(xs.dtype) * self.gate_up_s[ss]
+            h = torch.matmul(gu, xs.view(t, 1, shape[-1], 1)).squeeze(-1)
+            del gu
+            g, u = h.split(self.inter, dim=-1)
+            act = (F.silu(g) * u).unsqueeze(-1)                        # [t, k, I, 1]
+            dn = self.down[ss]                                         # [t, k, H, I]
+            if self.q8:
+                dn = dn.to(xs.dtype) * self.down_s[ss]
+            y = torch.matmul(dn, act).squeeze(-1)                      # [t, k, H]
+            del dn
+            outs.append((y * ws.unsqueeze(-1)).sum(dim=1))
+        return torch.cat(outs, dim=0).view(shape)
 
 
-def fuse_moe_blocks(model: nn.Module, verbose: bool = True) -> int:
+def fuse_moe_blocks(model: nn.Module, q8: bool = False, verbose: bool = True) -> int:
     """Replace every unquantized SparseMoeBlock in `model` with a FusedMoE.
 
     Skips blocks whose experts hold packed weights -- those need an int4-aware
@@ -108,7 +144,7 @@ def fuse_moe_blocks(model: nn.Module, verbose: bool = True) -> int:
     n = 0
     for parent, name in sites:
         child = getattr(parent, name)
-        fused = FusedMoE(child)
+        fused = FusedMoE(child, q8=q8)
         setattr(parent, name, fused)
         # Drop the originals now, per layer, so peak stays at
         # (all experts) + (one stacked layer) rather than double.
@@ -119,5 +155,5 @@ def fuse_moe_blocks(model: nn.Module, verbose: bool = True) -> int:
             torch.cuda.empty_cache()
         n += 1
     if verbose:
-        print(f"fused {n} MoE blocks (gather+bmm, was a Python expert loop)")
+        print(f"fused {n} MoE blocks (gather+bmm{', int8' if q8 else ''})")
     return n
