@@ -526,6 +526,108 @@ thinker. CUDA graphs and the pinned/streamed split are both untouched levers.
 The pattern across all three bugs: a component measured in kinder conditions than it
 runs in. That is what the loop was built to catch, and it caught three.
 
+## 19b. A system you can talk to
+
+**Energy VAD.** Three iterations, each corrected by measurement rather than reasoning.
+Calibrating the noise floor from the opening frames assumed the stream starts silent —
+on audio that starts mid-speech it set the floor to speech level and found 0.4 s of
+speech in a 12 s utterance. Min-following with a 9 dB threshold went the other way:
+the floor collapses to the quietest frame and pauses count as speech. Measuring the
+frame-energy distribution settled it — the silence/speech boundary sits ~30 dB above
+the noise floor consistently (floor −81.8 → ~−50; floor −68.6 → ~−38), while
+peak-relative varied (−35 vs −23 dB). Verified on synthetic turn-taking: 3 turns
+within ~0.1 s of truth, endpoints firing 0.56–0.62 s after speech stops.
+
+**WebSocket server + browser UI.** Int16 PCM at 16 kHz in, 24 kHz out, 80 ms frames
+both ways, JSON control messages interleaved. Served by the server itself rather than
+published, because artifact CSP blocks websockets to other hosts. Runs as a systemd
+unit — the model load is long and this box has a history of unplanned reboots.
+
+The transport is deliberately duplex-shaped: audio flows both directions continuously
+and VAD keeps running while the server speaks, so barge-in and eventually a duplex
+model slot in without a protocol change. What it does today is VAD-gated turn taking,
+and the UI says so plainly.
+
+Two bugs worth keeping:
+
+- **A 403 on the websocket handshake.** `server.py` uses `from __future__ import
+  annotations`, so annotations are strings that FastAPI resolves with `get_type_hints`
+  against *module* globals. The fastapi imports were inside `build_app`, making
+  `WebSocket` a local name; the annotation could not be resolved, `sock` was treated as
+  a query parameter, validation failed, and Starlette closed with a bare 403 before the
+  handler ran. `/health` worked, a minimal websocket server worked, and the code looked
+  correct — only the combination triggers it.
+- **`getUserMedia` needs a secure context.** Plain HTTP to a LAN address gets no
+  microphone. An SSH tunnel makes it a localhost origin, which browsers trust.
+
+The server also had to stop blocking on the model load: a 15-minute silent start is
+indistinguishable from a crash. It now serves immediately and reports load phase and
+elapsed time over both `/health` and the websocket.
+
+## 19c. Loading: 910 s to 44 s
+
+`from_pretrained` spends ~480 s of its ~910 s in compressed-tensors'
+`compress_model()` — the *save* path (pack a dense model to int4) reused on load to
+build the parameter structure. Its output is discarded here: this project dequantizes
+with its own Triton kernel and never touches compressed-tensors at runtime.
+
+Building the tree on meta and placing each shard tensor directly: **64,907 tensors,
+0 unmatched, 14 s.**
+
+Two bugs, both of which reported complete success while producing a broken model:
+
+- **`model.to_empty(device=...)`** reallocates *every* parameter as uninitialised
+  memory. Called to materialise the handful of tensors absent from the checkpoint, it
+  silently discarded all 64,907 just loaded — and logged the same "0 unmatched, 18 s"
+  as the correct version. It surfaced only because a `weight_shape` buffer read as
+  `3329622686324454514` and overflowed a `torch.empty`. A plausible value would have
+  shipped a loader that produces noise.
+- **Zeroed computed buffers.** Seven tensors are built in `__init__` rather than stored:
+  four `rotary_emb.inv_freq`, `code2wav.code_offset`, the audio tower's sinusoidal
+  positional embedding, and the vision rotary. Materialising them as zeros is
+  catastrophic and silent — `inv_freq = 0` gives every position an identical rotation,
+  so the thinker emitted `"\n\n\n't\n\n\n"`. `accelerate.init_empty_weights(
+  include_buffers=False)` is the right primitive: params on meta, buffers computed.
+
+Neither was visible in any log. Both were caught only by looking at the *output* —
+weight statistics, and then whether the generated text was coherent. The loader now
+asserts on any computed buffer still on meta.
+
+## 19d. The GPU engine, and what it is not
+
+`FastEngine` assembles what the benchmarks proved: Triton dequant-GEMV for the int4
+thinker, partial residency, `TritonPackedLinear` for attention, gather+bmm for the
+talker, streaming vocoder. An earlier hybrid CPU/GPU placement failed because
+transformers assumes one device; the fix was to put *everything* on the GPU and let
+host-resident MoE blocks hide their host tensors internally.
+
+Getting it running took five OOMs in a row, each fix correct and each revealing the
+next — dtype mismatch, prefill materialising `[T,k,2I,H]` (2.91 GiB for one layer),
+an illegal access from staging once for token 0 while the kernel indexed an 8-slot
+buffer with expert ids up to 127, the talker's bf16 gather, the vocoder's conv1d.
+The root cause was structural rather than a series of bugs: **11.56 of 11.63 GB was
+weights**, so any activation of consequence failed.
+
+int8 per-channel quantisation of the talker fixed that — 6.1 → 3.0 GB, cached to disk
+so restarts skip it. Controlled A/B (thinker only, identical work):
+
+```
+bf16 talker, 0 pinned   10.41 GB   3.87 tok/s
+int8 talker, 0 pinned    7.61 GB   3.87 tok/s     <- free
+int8 talker, 8 pinned    9.98 GB   4.18 tok/s     <- the freed memory buys pinning
+```
+
+**What FastEngine is not:** the clock path. It runs the full 48-layer thinker through
+transformers' `generate()`, which the profiler shows costs ~2.5x the raw forwards
+`clock-full` measures. The realtime claim rests on `clock-full`, not on this.
+
+**A claim that was wrong.** This engine was described as "8x better than the CPU path".
+It is not. Normalising for output length: CPU ~15–18 s of compute per second of audio,
+FastEngine ~6–15 s — roughly **1.5–2.5x**. The 8x came from comparing FastEngine's
+~45 s against the CPU's worst run (365 s) without noting that run produced 24 s of
+audio against 3–8 s. Exactly the confounding this document criticises elsewhere, made
+in my own favour.
+
 ## 20. Where the GPU engine's time actually goes
 
 `FastEngine` runs the full 48-layer model through transformers' `generate()` at
