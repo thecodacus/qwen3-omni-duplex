@@ -32,6 +32,14 @@ from pathlib import Path
 
 import numpy as np
 
+# Module scope, deliberately: this file uses `from __future__ import annotations`,
+# so every annotation is a string that FastAPI resolves with get_type_hints against
+# MODULE globals. Importing WebSocket inside build_app made it a local, so the
+# annotation could not be resolved, `sock` was treated as a query parameter, and the
+# handshake was rejected with a bare 403 before the handler ever ran.
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+
 FRAME_MS = 80.0
 IN_SR = 16000
 OUT_SR = 24000
@@ -89,8 +97,6 @@ class Engine:
 
 
 def build_app(engine: Engine, static_dir: Path):
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.responses import FileResponse
     from duplex.vad import EnergyVAD, State
 
     app = FastAPI()
