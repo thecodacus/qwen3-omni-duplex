@@ -27,6 +27,9 @@ def main():
     p.add_argument("--prompt", default="Say one short sentence about running AI locally.")
     p.add_argument("--max-new", type=int, default=24)
     p.add_argument("--cpu", action="store_true", help="force everything onto CPU")
+    p.add_argument("--speakers", default="Ethan",
+                   help="comma-separated voices; the checkpoint ships Chelsie, Ethan, Aiden. "
+                        "The load dominates runtime, so generating several per load is ~free.")
     p.add_argument("--frame-decode", action="store_true",
                    help="decode audio with the streaming vocoder at 80ms frames "
                         "instead of the shipped chunked_decode")
@@ -84,47 +87,44 @@ def main():
     if dev == "cuda":
         inputs = inputs.to(dev)
 
-    print(f"\ngenerating (max_new_tokens={a.max_new}, CPU + on-the-fly dequant: slow)...",
-          flush=True)
-    t0 = time.time()
-    with torch.inference_mode():
-        seq, wav = model.generate(
-            **inputs, return_audio=True, max_new_tokens=a.max_new,
-            thinker_do_sample=False, talker_do_sample=False,
-        )
-    gen_s = time.time() - t0
-
-    print(f"  generated in {gen_s:.0f}s", flush=True)
-
-    # Audio first: it is the thing that is expensive to reproduce, and text
-    # decoding has already destroyed one run by raising before the write.
-    sr = getattr(model.code2wav.config, "sampling_rate", 24000)
     import soundfile as sf
-    try:
-        w = (wav[0] if isinstance(wav, (list, tuple)) else wav)
-        w = w.reshape(-1).float().cpu().numpy()
-        sf.write(out / "speak_batch.wav", w, sr)
-        print(f"  AUDIO {len(w)/sr:.2f}s -> {out}/speak_batch.wav", flush=True)
-    except Exception as e:
-        print(f"  audio write FAILED: {type(e).__name__}: {e}")
+    sr = getattr(model.code2wav.config, "sampling_rate", 24000)
+    speakers = [x.strip() for x in a.speakers.split(",") if x.strip()]
 
-    # `generate(return_audio=True)` has returned different shapes across versions,
-    # so decode defensively rather than assuming a tensor of ids.
-    try:
-        if isinstance(seq, str):
-            said = seq
-        else:
-            ids = getattr(seq, "sequences", seq)   # GenerateDecoderOnlyOutput
+    for spk in speakers:
+        print(f"\ngenerating [{spk}] (max_new_tokens={a.max_new})...", flush=True)
+        t0 = time.time()
+        with torch.inference_mode():
+            seq, wav = model.generate(
+                **inputs, return_audio=True, max_new_tokens=a.max_new,
+                speaker=spk, thinker_do_sample=False, talker_do_sample=False,
+            )
+        print(f"  generated in {time.time()-t0:.0f}s", flush=True)
+
+        # Audio first: it is expensive to reproduce, and a text-decode error has
+        # already destroyed one run by raising before the write.
+        try:
+            w = (wav[0] if isinstance(wav, (list, tuple)) else wav)
+            w = w.reshape(-1).float().cpu().numpy()
+            path = out / f"speak_{spk.lower()}.wav"
+            sf.write(path, w, sr)
+            print(f"  AUDIO {len(w)/sr:.2f}s -> {path}", flush=True)
+        except Exception as e:
+            print(f"  audio write FAILED: {type(e).__name__}: {e}")
+
+        try:
+            ids = getattr(seq, "sequences", seq)
             if isinstance(ids, (list, tuple)):
                 ids = ids[0]
             if torch.is_tensor(ids) and ids.ndim == 1:
                 ids = ids.unsqueeze(0)
+            # dump raw ids so a bad decode can be diagnosed without a 15min reload
+            if torch.is_tensor(ids):
+                torch.save(ids.cpu(), out / f"ids_{spk.lower()}.pt")
             said = proc.batch_decode(ids, skip_special_tokens=True)[0]
-        print(f"  TEXT: {said[-400:]}")
-    except Exception as e:
-        print(f"  text decode failed ({type(e).__name__}: {e}); seq type={type(seq)}")
-        if torch.is_tensor(seq):
-            print(f"    seq shape={tuple(seq.shape)} dtype={seq.dtype}")
+            print(f"  TEXT: {said[-400:]}")
+        except Exception as e:
+            print(f"  text decode failed ({type(e).__name__}: {e}); type={type(seq)}")
 
     print("\nIf that text is coherent and the audio is intelligible, the int4 "
           "dequantization is correct and the speech stack is sound.")
