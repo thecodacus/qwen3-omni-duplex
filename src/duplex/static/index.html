@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>qwen3-omni-duplex</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --line:#232a34; --fg:#e6edf3; --dim:#8b949e;
+    --accent:#4ea1ff; --live:#3fb950; --warn:#d29922; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       display:flex;flex-direction:column;min-height:100vh}
+  header{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;
+         align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:13px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#444;flex:none}
+  .dot.on{background:var(--live);box-shadow:0 0 8px var(--live)}
+  .dot.busy{background:var(--warn);box-shadow:0 0 8px var(--warn)}
+  main{flex:1;display:grid;grid-template-columns:1fr 320px;gap:18px;padding:18px 22px}
+  @media(max-width:820px){main{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  button{background:var(--accent);color:#04121f;border:0;border-radius:8px;
+         padding:10px 18px;font-size:14px;font-weight:600;cursor:pointer}
+  button.sec{background:#21262d;color:var(--fg);border:1px solid var(--line)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  #meter{height:8px;background:#0b0f14;border-radius:99px;overflow:hidden;margin:14px 0 6px}
+  #bar{height:100%;width:0;background:var(--live);transition:width .05s linear}
+  #log{font-family:var(--mono);font-size:12px;color:var(--dim);height:230px;
+       overflow:auto;white-space:pre-wrap;line-height:1.55}
+  .turn{border-left:2px solid var(--accent);padding:8px 0 8px 12px;margin:12px 0}
+  .turn .who{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.7px}
+  #convo{max-height:340px;overflow:auto}
+  dl{display:grid;grid-template-columns:auto auto;gap:6px 14px;margin:0;font-size:13px}
+  dt{color:var(--dim)} dd{margin:0;font-family:var(--mono)}
+  .note{color:var(--dim);font-size:12px;margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>qwen3-omni-duplex</h1>
+  <span class="sub" id="sub">disconnected</span>
+  <span style="flex:1"></span>
+  <button id="start">Connect &amp; start mic</button>
+  <button id="stop" class="sec" disabled>Stop</button>
+</header>
+
+<main>
+  <div class="panel">
+    <div style="display:flex;align-items:center;gap:10px">
+      <strong style="font-size:13px" id="vadstate">idle</strong>
+      <span class="sub" id="hint">speak, then pause — it replies on the pause</span>
+    </div>
+    <div id="meter"><div id="bar"></div></div>
+    <div id="convo"></div>
+  </div>
+
+  <div class="panel">
+    <dl>
+      <dt>frames sent</dt><dd id="sent">0</dd>
+      <dt>frames recvd</dt><dd id="recv">0</dd>
+      <dt>last gen</dt><dd id="gen">—</dd>
+      <dt>audio out</dt><dd id="aud">—</dd>
+      <dt>realtime</dt><dd id="rtf">—</dd>
+    </dl>
+    <div id="log"></div>
+    <div class="note">
+      VAD-gated turn taking, not full duplex — the model has no trained ability to
+      stay quiet while you speak. The transport is duplex-shaped so a duplex model
+      drops in unchanged.
+    </div>
+  </div>
+</main>
+
+<script>
+const FRAME_MS=80, IN_SR=16000, OUT_SR=24000, IN_FRAME=IN_SR*FRAME_MS/1000;
+let ws, ac, node, stream, playAt=0, sent=0, recv=0;
+const $=id=>document.getElementById(id);
+const log=m=>{const l=$('log');l.textContent+=m+"\n";l.scrollTop=l.scrollHeight};
+
+function setState(s,cls){ $('vadstate').textContent=s; $('dot').className='dot '+(cls||''); }
+
+function addTurn(who,text){
+  const d=document.createElement('div'); d.className='turn';
+  d.innerHTML='<div class="who"></div><div class="body"></div>';
+  d.querySelector('.who').textContent=who; d.querySelector('.body').textContent=text;
+  $('convo').appendChild(d); $('convo').scrollTop=$('convo').scrollHeight;
+}
+
+// Int16 PCM @24k -> scheduled playback, gapless
+function playFrame(int16){
+  const f=new Float32Array(int16.length);
+  for(let i=0;i<int16.length;i++) f[i]=int16[i]/32768;
+  const buf=ac.createBuffer(1,f.length,OUT_SR); buf.copyToChannel(f,0);
+  const src=ac.createBufferSource(); src.buffer=buf; src.connect(ac.destination);
+  const now=ac.currentTime;
+  if(playAt<now) playAt=now+0.05;      // small lead-in so frames don't underrun
+  src.start(playAt); playAt+=buf.duration;
+}
+
+async function start(){
+  ac=new (window.AudioContext||window.webkitAudioContext)();
+  stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,
+    echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(`${proto}://${location.host}/ws`); ws.binaryType='arraybuffer';
+
+  ws.onopen=()=>{ $('sub').textContent='connected'; setState('idle','on');
+                  $('start').disabled=true; $('stop').disabled=false; log('ws open'); };
+  ws.onclose=()=>{ $('sub').textContent='disconnected'; setState('idle',''); log('ws closed'); };
+  ws.onmessage=ev=>{
+    if(typeof ev.data!=='string'){ recv++; $('recv').textContent=recv;
+      playFrame(new Int16Array(ev.data)); return; }
+    const m=JSON.parse(ev.data);
+    if(m.type==='state'){ setState(m.vad, m.vad==='speaking'?'on':'');
+      if(m.vad==='endpoint') log(`endpoint (${m.utterance_s}s captured)`); }
+    else if(m.type==='status'){ log(m.msg); if(m.msg==='thinking'){setState('thinking','busy');} }
+    else if(m.type==='text'){ const t=m.text.split('assistant').pop().trim();
+      addTurn('assistant', t); }
+    else if(m.type==='audio_start'){ playAt=0; log('audio incoming'); }
+    else if(m.type==='audio_end'){
+      $('gen').textContent=m.gen_s+'s'; $('aud').textContent=m.audio_s+'s';
+      $('rtf').textContent=m.realtime_factor+'x';
+      log(`done: ${m.frames} frames, gen ${m.gen_s}s for ${m.audio_s}s audio`);
+      setState('idle','on'); }
+  };
+
+  // 48k mic -> 16k mono frames. ScriptProcessor is deprecated but universally
+  // available and adequate at this frame size.
+  const srcNode=ac.createMediaStreamSource(stream);
+  node=ac.createScriptProcessor(4096,1,1);
+  let acc=[];
+  node.onaudioprocess=e=>{
+    const inBuf=e.inputBuffer.getChannelData(0);
+    const ratio=ac.sampleRate/IN_SR;
+    for(let i=0;i<inBuf.length/ratio;i++) acc.push(inBuf[Math.floor(i*ratio)]);
+    let peak=0; for(const v of inBuf) peak=Math.max(peak,Math.abs(v));
+    $('bar').style.width=Math.min(100,peak*180)+'%';
+    while(acc.length>=IN_FRAME){
+      const chunk=acc.slice(0,IN_FRAME); acc=acc.slice(IN_FRAME);
+      const pcm=new Int16Array(IN_FRAME);
+      for(let i=0;i<IN_FRAME;i++) pcm[i]=Math.max(-32768,Math.min(32767,chunk[i]*32767));
+      if(ws.readyState===1){ ws.send(pcm.buffer); sent++; $('sent').textContent=sent; }
+    }
+  };
+  srcNode.connect(node); node.connect(ac.destination);
+}
+
+function stop(){
+  if(node) node.disconnect();
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  if(ws) ws.close();
+  $('start').disabled=false; $('stop').disabled=true;
+}
+
+$('start').onclick=()=>start().catch(e=>log('error: '+e.message));
+$('stop').onclick=stop;
+</script>
+</body>
+</html>
