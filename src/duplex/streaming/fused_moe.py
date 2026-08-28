@@ -57,6 +57,18 @@ class FusedMoE(nn.Module):
         self.top_k = block.top_k
         self.norm_topk_prob = getattr(block, "norm_topk_prob", True)
         self.gate = block.gate
+        # The TALKER's block has a shared expert whose output is added to every
+        # token on top of the routed experts:
+        #
+        #   shared = sigmoid(shared_expert_gate(x)) * shared_expert(x)
+        #   out    = routed + shared
+        #
+        # Dropping it measured 49% relative error against the original block and
+        # is what made the generated speech tear. The thinker's block has no
+        # shared expert, which is why its fused path was fine and the text stayed
+        # coherent while the audio did not.
+        self.shared_expert = getattr(block, "shared_expert", None)
+        self.shared_expert_gate = getattr(block, "shared_expert_gate", None)
 
         dtype = e0.gate_proj.weight.dtype
         dev = e0.gate_proj.weight.device
@@ -119,7 +131,14 @@ class FusedMoE(nn.Module):
             y = torch.matmul(dn, act).squeeze(-1)                      # [t, k, H]
             del dn
             outs.append((y * ws.unsqueeze(-1)).sum(dim=1))
-        return torch.cat(outs, dim=0).view(shape)
+        out = torch.cat(outs, dim=0)
+
+        if self.shared_expert is not None:
+            shared = self.shared_expert(x)
+            if self.shared_expert_gate is not None:
+                shared = F.sigmoid(self.shared_expert_gate(x)) * shared
+            out = out + shared
+        return out.view(shape)
 
 
 def fuse_moe_blocks(model: nn.Module, q8: bool = False, verbose: bool = True) -> int:

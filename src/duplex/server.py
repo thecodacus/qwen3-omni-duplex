@@ -143,18 +143,30 @@ def build_app(engine: Engine, static_dir: Path):
         await sock.accept()
         vad = EnergyVAD(sample_rate=IN_SR, frame_ms=FRAME_MS)
         vad.reset()
+        last_level = {"db": -99.0}
         await sock.send_text(json.dumps({"type": "status", "msg": "connected"}))
         await sock.send_text(json.dumps({"type": "model", **engine.status}))
+        await sock.send_text(json.dumps({"type": "vadcfg", **vad.settings()}))
         busy = False
         told_loading = False
+        pending = []          # generation tasks that finished while we kept reading
+        t0_gen = []
+        frameq = []           # audio frames produced by the streaming engine
+        sent_frames = [0]
 
         try:
             while True:
                 msg = await sock.receive()
                 if "text" in msg and msg["text"]:
-                    if json.loads(msg["text"]).get("type") == "reset":
+                    m = json.loads(msg["text"])
+                    if m.get("type") == "reset":
                         vad.reset()
                         await sock.send_text(json.dumps({"type": "status", "msg": "reset"}))
+                    elif m.get("type") == "config":
+                        st = vad.configure(**{k: m.get(k) for k in
+                                              ("onset_frames", "hangover_frames",
+                                               "threshold_db")})
+                        await sock.send_text(json.dumps({"type": "vadcfg", **st}))
                     continue
                 data = msg.get("bytes")
                 if not data:
@@ -177,7 +189,23 @@ def build_app(engine: Engine, static_dir: Path):
                     await sock.send_text(json.dumps({"type": "model", **engine.status}))
                     told_loading = False
 
-                if state is State.ENDPOINT and not busy:
+                # Ship any audio frames produced since the last message.
+                while frameq:
+                    f = frameq.pop(0)
+                    pcm = (np.clip(f, -1, 1) * 32767).astype(np.int16)
+                    await sock.send_bytes(pcm.tobytes())
+                    sent_frames[0] += 1
+
+                if busy:
+                    # A turn is being generated. Keep draining the socket -- the
+                    # client streams 12.5 frames/s throughout, and blocking here
+                    # fills the receive buffer and kills the connection. Reset the
+                    # VAD so speech during playback does not queue a second turn;
+                    # this is where barge-in will hook in.
+                    vad.reset()
+                    continue
+
+                if state is State.ENDPOINT:
                     utt = vad.take_utterance()
                     await sock.send_text(json.dumps(
                         {"type": "state", "vad": "endpoint",
@@ -185,28 +213,64 @@ def build_app(engine: Engine, static_dir: Path):
                     if len(utt) < IN_SR * 0.3:      # ignore coughs
                         continue
                     busy = True
-                    await sock.send_text(json.dumps(
-                        {"type": "status", "msg": "thinking"}))
-                    t0 = time.time()
-                    said, wav = await asyncio.to_thread(engine.generate, utt)
-                    gen_s = time.time() - t0
-                    if said:
-                        await sock.send_text(json.dumps({"type": "text", "text": said}))
+                    await sock.send_text(json.dumps({"type": "status", "msg": "thinking"}))
+                    t0_gen.clear(); t0_gen.append(time.time())
                     await sock.send_text(json.dumps({"type": "audio_start", "sr": OUT_SR}))
-                    n = 0
-                    for i in range(0, len(wav) - OUT_FRAME + 1, OUT_FRAME):
-                        pcm = (np.clip(wav[i:i + OUT_FRAME], -1, 1) * 32767).astype(np.int16)
-                        await sock.send_bytes(pcm.tobytes())
-                        n += 1
-                        await asyncio.sleep(0)      # let the socket drain
-                    await sock.send_text(json.dumps(
-                        {"type": "audio_end", "frames": n,
-                         "gen_s": round(gen_s, 1),
-                         "audio_s": round(len(wav) / OUT_SR, 2),
-                         "realtime_factor": round((len(wav) / OUT_SR) / max(gen_s, 1e-9), 3)}))
-                    busy = False
+                    # Stream frames as the talker produces them. First audio lands
+                    # ~5x sooner than waiting for the whole utterance.
+                    if hasattr(engine, "generate_streaming"):
+                        loop = asyncio.get_running_loop()
+                        def emit(f, _l=loop):
+                            _l.call_soon_threadsafe(frameq.append, f)
+                        task = asyncio.create_task(
+                            asyncio.to_thread(engine.generate_streaming, utt, emit))
+                    else:
+                        task = asyncio.create_task(asyncio.to_thread(engine.generate, utt))
+                    task.add_done_callback(lambda t: pending.append(t))
                 elif state is not State.IDLE:
                     await sock.send_text(json.dumps({"type": "state", "vad": state.value}))
+                else:
+                    db = vad._db(frame[:IN_FRAME])
+                    if abs(db - last_level["db"]) > 3.0:
+                        last_level["db"] = db
+                        await sock.send_text(json.dumps(
+                            {"type": "level", "db": round(db, 1),
+                             "floor": round(vad._floor, 1) if vad._floor is not None else None,
+                             "thresh": round((vad._floor or -60) + vad.threshold_db, 1)}))
+
+                # Deliver a finished turn, if one completed while we kept reading.
+                while pending:
+                    t = pending.pop(0)
+                    try:
+                        res = t.result()
+                    except Exception as e:
+                        await sock.send_text(json.dumps(
+                            {"type": "status", "msg": f"generate failed: {e}"}))
+                        busy = False
+                        continue
+                    gen_s = time.time() - t0_gen[0] if t0_gen else 0.0
+                    if isinstance(res, tuple):          # non-streaming engine
+                        said, wav = res
+                        for i in range(0, len(wav) - OUT_FRAME + 1, OUT_FRAME):
+                            pcm = (np.clip(wav[i:i + OUT_FRAME], -1, 1) * 32767).astype(np.int16)
+                            await sock.send_bytes(pcm.tobytes())
+                            sent_frames[0] += 1
+                    else:
+                        said = res
+                    while frameq:                       # drain the tail
+                        pcm = (np.clip(frameq.pop(0), -1, 1) * 32767).astype(np.int16)
+                        await sock.send_bytes(pcm.tobytes())
+                        sent_frames[0] += 1
+                    if said:
+                        await sock.send_text(json.dumps({"type": "text", "text": said}))
+                    n = sent_frames[0]; sent_frames[0] = 0
+                    audio_s = n * FRAME_MS / 1000
+                    await sock.send_text(json.dumps(
+                        {"type": "audio_end", "frames": n,
+                         "gen_s": round(gen_s, 1), "audio_s": round(audio_s, 2),
+                         "realtime_factor": round(audio_s / max(gen_s, 1e-9), 3)}))
+                    vad.reset()
+                    busy = False
         except WebSocketDisconnect:
             pass
         except Exception as e:

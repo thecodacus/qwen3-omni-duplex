@@ -41,7 +41,9 @@ class EnergyVAD:
     sample_rate: int = 24000
     frame_ms: float = 80.0           # match the model's 12.5 Hz clock
     onset_frames: int = 2            # consecutive loud frames to start
-    hangover_frames: int = 8         # consecutive quiet frames to end (~0.64 s)
+    # 4 frames = 320 ms. Was 8 (640 ms), which felt like a long wait before the
+    # assistant took its turn. Lower is snappier but cuts off mid-sentence pauses.
+    hangover_frames: int = 4
     # 25 dB above the floor, measured rather than guessed: across generated
     # samples the silence/speech boundary sat ~30 dB above the noise floor
     # (floor -81.8 -> boundary ~-50; floor -68.6 -> boundary ~-38), while
@@ -66,6 +68,24 @@ class EnergyVAD:
     def _db(x: np.ndarray) -> float:
         rms = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)) + 1e-12)
         return 20.0 * np.log10(rms)
+
+    def configure(self, **kw):
+        """Update tuning live. Unknown keys are ignored."""
+        for k, v in kw.items():
+            if k in ("onset_frames", "hangover_frames") and v is not None:
+                setattr(self, k, max(1, int(v)))
+            elif k in ("threshold_db", "floor_db", "floor_rise_db") and v is not None:
+                setattr(self, k, float(v))
+        return self.settings()
+
+    def settings(self):
+        return {
+            "onset_frames": self.onset_frames,
+            "hangover_frames": self.hangover_frames,
+            "threshold_db": self.threshold_db,
+            "hangover_ms": round(self.hangover_frames * self.frame_ms),
+            "floor_db": round(self._floor, 1) if self._floor is not None else None,
+        }
 
     def reset(self):
         self._floor = None

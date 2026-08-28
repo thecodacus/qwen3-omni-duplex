@@ -155,6 +155,12 @@ class FastEngine:
 
         self._set("placing on GPU", "everything must report as a GPU module")
         model = model.to(dev)
+
+        # code2wav stays bf16. fp32 was tried on the theory that its overlap-add
+        # conv stack was causing the torn audio; it changed nothing (env 1.49 vs
+        # 1.60, max-jump 0.399 vs 0.379) and cost ~0.4 GB plus fp32 activations,
+        # which OOMed. The tearing was FusedMoE dropping the talker's shared
+        # expert -- 49% relative error, now 0.004.
         torch.cuda.empty_cache()
 
         if self.compile_mode:
@@ -171,6 +177,80 @@ class FastEngine:
         gb = torch.cuda.memory_allocated() / 1024**3
         log(f"fast engine ready in {time.time()-t0:.0f}s, {gb:.2f} GB resident")
         self._set("ready", f"{gb:.2f} GB on GPU")
+
+    # ---- streaming generate --------------------------------------------------
+    def generate_streaming(self, user_audio, on_frame, max_new: int = 48,
+                           frames_per_token: int = 6):
+        """Emit 80 ms audio frames as the talker produces them.
+
+        The talker's `prepare_inputs_for_generation` builds `residual_codes` -- the
+        full 16-codebook frame -- on every step. Wrapping it captures each frame at
+        the moment it exists, so audio can be decoded and sent while generation
+        continues, instead of waiting for the whole utterance.
+
+        `trailing_text_hidden` is only ever read at `[:, generation_step]`, which is
+        why this works without touching the generation loop.
+
+        Returns the text; frames go to `on_frame(float32[1920])`.
+        """
+        torch = self.torch
+        from duplex.streaming.code2wav import StreamingCode2Wav
+
+        conv = [{"role": "user", "content": [{"type": "audio", "audio": user_audio}]}]
+        text = self.proc.apply_chat_template(conv, add_generation_prompt=True,
+                                             tokenize=False)
+        inputs = self.proc(text=text, audio=[user_audio], return_tensors="pt").to(self.dev)
+        for k in list(inputs.keys()):
+            v = inputs[k]
+            if torch.is_tensor(v) and v.is_floating_point():
+                inputs[k] = v.to(self.dtype)
+
+        talker = self.model.talker
+        c2w = self.model.code2wav
+        sc = StreamingCode2Wav(c2w).install()
+        sc.reset()
+        orig_prep = talker.prepare_inputs_for_generation
+        n_groups = self.model.config.talker_config.num_code_groups
+
+        import functools
+
+        # transformers inspects this method's signature to validate model_kwargs,
+        # so the wrapper must advertise the original's parameters or generate()
+        # rejects trailing_text_hidden, tts_pad_embed and friends.
+        @functools.wraps(orig_prep)
+        def prep(*a, **kw):
+            out = orig_prep(*a, **kw)
+            codes = out.get("residual_codes")
+            if codes is not None and codes.shape[-1] == n_groups:
+                with torch.inference_mode():
+                    wav = sc.decode(codes.view(1, n_groups, 1).to(self.dev))
+                on_frame(wav.reshape(-1).float().cpu().numpy())
+            return out
+
+        talker.prepare_inputs_for_generation = prep
+        try:
+            with torch.inference_mode():
+                # Cap the talker. Left uncapped it runs away: 32 text tokens
+                # produced 1619 frames = 129.5 s of audio, which was most of a
+                # 210 s turn. Speech is ~4-6 frames per text token at 12.5 Hz, so
+                # this bounds it without truncating normal replies.
+                seq, _ = self.model.generate(
+                    **inputs, return_audio=True, max_new_tokens=max_new,
+                    talker_max_new_tokens=max_new * frames_per_token,
+                    speaker=self.speaker, thinker_do_sample=False,
+                    talker_do_sample=False,
+                )
+        finally:
+            talker.prepare_inputs_for_generation = orig_prep
+            sc.remove()
+
+        said = ""
+        try:
+            ids = getattr(seq, "sequences", seq)
+            said = self.proc.batch_decode(ids, skip_special_tokens=True)[0]
+        except Exception:
+            pass
+        return said
 
     # ---- generate -----------------------------------------------------------
     def generate(self, user_audio: np.ndarray, max_new: int = 48):
