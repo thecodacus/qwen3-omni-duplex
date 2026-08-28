@@ -343,3 +343,80 @@ against a symptom created by the grep.
 | `expandable_segments:True` cost, hidden in p99.9 | +68 ms |
 | Final clock path | ~66 ms vs 80 ms budget |
 | Times the llama.cpp answer flipped | 3 |
+
+## 16. End to end on real speech
+
+`duplex speak --frame-decode` — generate, capture the Talker's real codec codes,
+re-decode them one 80 ms frame at a time through the stateful vocoder, compare against
+the batch path. Every previous vocoder measurement used synthetic codes.
+
+24.03 s of speech, 301 frames:
+
+```
+batch      576810 samples
+streaming  577365 samples      delta +555
+per-frame  mean 10.51 ms   p99 16.19 ms   max 25.39 ms   vs 80 ms budget
+realtime   7.6x faster than playback
+```
+
+**The +555 is the prediction landing.** Section 5 derived 555 samples analytically from
+the decoder blocks' right-trims (3 + 12 + 60 + 480). Here the streaming path emits
+exactly 555 more samples than the batch path, on real content — it keeps the tail the
+batch decoder discards.
+
+Agreement is essentially exact where the two paths should agree:
+
+```
+mean|diff|                    0.000031
+median per-80ms-frame error   0.00006      (-77 dB)
+worst frame                   0.04843  at frame 299/300  <- the last one
+```
+
+299 of 300 frames match to 6e-05. The whole discrepancy is the final frame, which is
+where the implementations differ by design. An initial reading of the headline
+`max|diff| = 0.052` as "17x worse on real codes than synthetic" was wrong — it is a
+boundary effect, not distributed degradation.
+
+Text generated across those 24 seconds:
+
+> "Running a language model on your own hardware gives you full control over data
+> privacy, customization, and deployment, but requires significant technical expertise
+> and computational resources. In contrast, using an API offers convenience,
+> scalability, and lower upfront costs, but limits customization and may involve data
+> privacy concerns since inputs are processed externally."
+
+## 17. How the duplex training would actually work
+
+Researched rather than assumed. Moshi's recipe ([kyutai.org/Moshi.pdf](https://kyutai.org/Moshi.pdf)):
+
+```
+pre-training    unsupervised audio       1016 H100s / 127 DGX nodes
+post-training   simulated multi-stream via PyAnnote diarization, 100K steps, 8h batch
+full-duplex     Fisher (2000h dual-channel), 10,000 steps
+instruction FT  synthetic
+```
+
+**The full-duplex stage is 10,000 steps.** The 1016 H100s went into pre-training, which
+is skipped here — the Talker is already trained. What is needed is the last-mile
+behaviour fine-tune on a 3B model with ~230M active params.
+
+**Dual-channel data does not require the Fisher licence.** Moshi's own post-training
+synthesised multi-stream data by diarizing ordinary single-channel conversation with
+PyAnnote and splitting each speaker into a channel. Two-person podcasts and interviews
+are unlimited free source material, and the diarization bleed during overlap is exactly
+the interruption signal. Fisher was the final polish, not the foundation. A 15-hour open
+dual-track set ([arXiv 2509.04093](https://arxiv.org/html/2509.04093), EN + ZH,
+speaker-isolated) works as clean validation; CANDOR as OOD eval.
+
+**Possible shortcut, unverified:** [SoulX-Duplug](https://arxiv.org/pdf/2603.14877)
+trains a small external "streaming state prediction module" for speak/listen decisions
+instead of fine-tuning the model. If that transfers to a Thinker/Talker split it is
+consumer-GPU-sized work. Not yet read closely.
+
+**Silence is already producible.** Generated samples measure 15.4% and 10.1% silent
+frames — the Talker already emits codec tokens that decode to near-zero audio during
+pauses. What is missing is *control* (choosing silence for an unbounded stretch because
+someone else is speaking), not *representation*.
+
+This corrects a claim repeated throughout the project that dual-channel data was an
+immovable blocker. It is neither immovable nor, apparently, expensive.
