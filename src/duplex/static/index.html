@@ -37,6 +37,16 @@
   dl{display:grid;grid-template-columns:auto auto;gap:6px 14px;margin:0;font-size:13px}
   dt{color:var(--dim)} dd{margin:0;font-family:var(--mono)}
   .note{color:var(--dim);font-size:12px;margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+  #loading{display:none;background:#1c2027;border:1px solid var(--warn);border-radius:10px;
+           padding:14px 16px;margin-bottom:16px}
+  #loading.show{display:block}
+  #loading .row{display:flex;align-items:center;gap:10px;font-size:14px}
+  .spin{width:14px;height:14px;border:2px solid #3a3f46;border-top-color:var(--warn);
+        border-radius:50%;animation:sp .8s linear infinite;flex:none}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  #lbar{height:6px;background:#0b0f14;border-radius:99px;overflow:hidden;margin-top:10px}
+  #lfill{height:100%;width:0;background:var(--warn);transition:width .6s linear}
+  #ldetail{color:var(--dim);font-size:12px;margin-top:8px;font-family:var(--mono)}
 </style>
 </head>
 <body>
@@ -51,6 +61,13 @@
 
 <main>
   <div class="panel">
+    <div id="loading">
+      <div class="row"><span class="spin"></span>
+        <strong id="lphase">loading model</strong>
+        <span style="flex:1"></span><span id="lelapsed" class="sub"></span></div>
+      <div id="lbar"><div id="lfill"></div></div>
+      <div id="ldetail"></div>
+    </div>
     <div style="display:flex;align-items:center;gap:10px">
       <strong style="font-size:13px" id="vadstate">idle</strong>
       <span class="sub" id="hint">speak, then pause — it replies on the pause</span>
@@ -78,11 +95,38 @@
 
 <script>
 const FRAME_MS=80, IN_SR=16000, OUT_SR=24000, IN_FRAME=IN_SR*FRAME_MS/1000;
-let ws, ac, node, stream, playAt=0, sent=0, recv=0;
+let ws, ac, node, stream, playAt=0, sent=0, recv=0, modelReady=false;
+const LOAD_EST=930;   // seconds; only drives the progress bar, not correctness
 const $=id=>document.getElementById(id);
 const log=m=>{const l=$('log');l.textContent+=m+"\n";l.scrollTop=l.scrollHeight};
 
 function setState(s,cls){ $('vadstate').textContent=s; $('dot').className='dot '+(cls||''); }
+
+function showModel(m){
+  modelReady = !!m.ready;
+  const box=$('loading');
+  if(m.ready){
+    box.classList.remove('show');
+    $('hint').textContent='speak, then pause — it replies on the pause';
+    $('start').disabled = (ws && ws.readyState===1);
+    return;
+  }
+  box.classList.add('show');
+  $('lphase').textContent = m.phase==='failed' ? 'model failed to load' : ('loading model — '+m.phase);
+  $('lelapsed').textContent = m.elapsed ? Math.round(m.elapsed)+'s / ~'+LOAD_EST+'s' : '';
+  $('ldetail').textContent = m.detail || '';
+  $('lfill').style.width = Math.min(97,(m.elapsed||0)/LOAD_EST*100)+'%';
+  if(m.phase==='failed'){ $('lfill').style.background='#f85149'; $('.spin'); }
+  $('hint').textContent='model still loading — mic works, replies start when ready';
+}
+
+async function pollHealth(){
+  try{
+    const r=await fetch('/health'); const m=await r.json(); showModel(m);
+    if(!m.ready && m.phase!=='failed') setTimeout(pollHealth,2000);
+  }catch(e){ setTimeout(pollHealth,4000); }
+}
+pollHealth();
 
 function addTurn(who,text){
   const d=document.createElement('div'); d.className='turn';
@@ -119,6 +163,7 @@ async function start(){
     const m=JSON.parse(ev.data);
     if(m.type==='state'){ setState(m.vad, m.vad==='speaking'?'on':'');
       if(m.vad==='endpoint') log(`endpoint (${m.utterance_s}s captured)`); }
+    else if(m.type==='model'){ showModel(m); log('model: '+m.phase+(m.detail?' — '+m.detail:'')); }
     else if(m.type==='status'){ log(m.msg); if(m.msg==='thinking'){setState('thinking','busy');} }
     else if(m.type==='text'){ const t=m.text.split('assistant').pop().trim();
       addTurn('assistant', t); }

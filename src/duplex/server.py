@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -56,6 +57,29 @@ class Engine:
         self.speaker = speaker
         self.model = None
         self.proc = None
+        # Loading takes ~15 min, so the server must not block on it: it serves
+        # immediately and reports progress, otherwise a restart is indistinguishable
+        # from a crash for a quarter of an hour.
+        self.status = {"ready": False, "phase": "not started", "elapsed": 0.0,
+                       "detail": ""}
+        self._t0 = None
+
+    def start_background_load(self):
+        self._t0 = time.time()
+        self.status.update(phase="starting", detail="spawning loader")
+        threading.Thread(target=self._load_guarded, daemon=True).start()
+
+    def _set(self, phase, detail=""):
+        self.status.update(phase=phase, detail=detail,
+                           elapsed=round(time.time() - (self._t0 or time.time()), 1))
+
+    def _load_guarded(self):
+        try:
+            self.load(log=lambda m: self._set(self.status["phase"], m))
+            self.status.update(ready=True, phase="ready",
+                               elapsed=round(time.time() - self._t0, 1))
+        except Exception as e:
+            self.status.update(ready=False, phase="failed", detail=f"{type(e).__name__}: {e}")
 
     def load(self, log=print):
         import torch
@@ -63,12 +87,14 @@ class Engine:
         from duplex.quant.dequant import patch_packed_linears
 
         t0 = time.time()
-        log("loading model (~15 min, once per server lifetime)")
         self.torch = torch
+        self._set("loading weights", "reading shards, ~13 min")
         self.model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
             self.model_path, device_map="cpu", dtype=torch.float32,
         ).eval()
+        self._set("patching", "installing int4 dequant")
         patch_packed_linears(self.model, verbose=False)
+        self._set("processor", "tokenizer + feature extractor")
         self.proc = Qwen3OmniMoeProcessor.from_pretrained(self.model_path)
         log(f"model ready in {time.time()-t0:.0f}s")
 
@@ -107,7 +133,10 @@ def build_app(engine: Engine, static_dir: Path):
 
     @app.get("/health")
     async def health():
-        return {"ready": engine.model is not None}
+        st = dict(engine.status)
+        if not st["ready"] and engine._t0:
+            st["elapsed"] = round(time.time() - engine._t0, 1)
+        return st
 
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
@@ -115,7 +144,9 @@ def build_app(engine: Engine, static_dir: Path):
         vad = EnergyVAD(sample_rate=IN_SR, frame_ms=FRAME_MS)
         vad.reset()
         await sock.send_text(json.dumps({"type": "status", "msg": "connected"}))
+        await sock.send_text(json.dumps({"type": "model", **engine.status}))
         busy = False
+        told_loading = False
 
         try:
             while True:
@@ -133,6 +164,18 @@ def build_app(engine: Engine, static_dir: Path):
                 if len(frame) < IN_FRAME:
                     continue
                 state = vad.push(frame[:IN_FRAME])
+
+                if not engine.status["ready"]:
+                    # Keep consuming audio so the client's stream never stalls, but
+                    # do not accumulate an utterance against a model that cannot answer.
+                    vad.reset()
+                    if not told_loading:
+                        await sock.send_text(json.dumps({"type": "model", **engine.status}))
+                        told_loading = True
+                    continue
+                if told_loading:
+                    await sock.send_text(json.dumps({"type": "model", **engine.status}))
+                    told_loading = False
 
                 if state is State.ENDPOINT and not busy:
                     utt = vad.take_utterance()
@@ -181,15 +224,24 @@ def main():
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=877)
     p.add_argument("--speaker", default="Ethan")
+    p.add_argument("--cpu", action="store_true",
+                   help="use the slow CPU engine instead of the GPU one")
+    p.add_argument("--pinned", type=int, default=4,
+                   help="thinker MoE layers kept on the GPU (of 48); the rest stream")
     a = p.parse_args()
 
     import uvicorn
 
     static = Path(__file__).parent / "static"
-    engine = Engine(a.model, speaker=a.speaker)
-    engine.load()
+    if a.cpu:
+        engine = Engine(a.model, speaker=a.speaker)
+    else:
+        from duplex.fast_engine import FastEngine
+        engine = FastEngine(a.model, speaker=a.speaker, n_pinned=a.pinned)
     app = build_app(engine, static)
-    print(f"serving on http://{a.host}:{a.port}", flush=True)
+    engine.start_background_load()
+    print(f"serving on http://{a.host}:{a.port} (model loading in background)",
+          flush=True)
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
 
 
