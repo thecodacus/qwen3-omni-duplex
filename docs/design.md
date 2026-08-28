@@ -378,3 +378,61 @@ PCIe at 25.9 GB/s = 17.5 ms, which the 43.1 ms headroom would absorb).
 2. **A Triton dequant-GEMV** — fuse unpack+scale+matmul into one kernel. Self-contained
    and keeps everything else as-is.
 3. **llama.cpp** — has the kernels, lacks the Talker, MTP, Code2Wav and the tap.
+
+## 11. Solved — Triton dequant-GEMV, and llama.cpp is not required
+
+`triton_dequant_gemv.py` does the unpack in registers during accumulation: each
+program owns a block of output rows for one selected expert, streams packed words,
+expands nibbles, applies the group scale, and multiplies into an accumulator. Dense
+weights never reach memory.
+
+Verified against the torch path: **rel error 2.5e-07**, pure fp32 rounding.
+
+| | per Thinker MoE layer | x24 layers |
+|---|---|---|
+| torch gather + unpack + bmm | 4.078 ms | 97.9 ms |
+| **Triton dequant-GEMV** | **0.639 ms** | **15.3 ms** |
+
+6.4x, against 43.1 ms of headroom. Estimated full clock path:
+
+```
+talker + MTP + vocoder (fused bf16)   36.85 ms p99.9
+Thinker[0:24] MoE (triton int4)       15.3 ms
+Thinker[0:24] attention (~25% of MoE)  ~4 ms
+                                      -------
+                                      ~56 ms  vs 80 ms budget
+```
+
+**This settles the llama.cpp question.** The dividing line was never framework, it was
+whether int4 dequantization happens in memory or in registers. A ~90-line Triton
+kernel moves it into registers and PyTorch is sufficient end to end.
+
+### The binding constraint is now memory, not speed
+
+```
+Thinker[0:24] packed   8.4 GB   (0.35 GB/layer x 24)
+fused bf16 Talker      6.1 GB
+                      ------
+                      14.5 GB  vs a 12 GB card
+```
+
+Two ways out:
+
+1. **Quantize the Talker too.** It ships bf16 in this build; int4 would take it from
+   6.1 GB to ~1.6 GB, giving 10.0 GB total. The Triton kernel already handles the
+   format, so the Talker would also get faster.
+2. **Stream the Thinker's experts from host RAM.** 8 experts x 24 layers x 2.36 MB =
+   453 MB/token, at 25.9 GB/s measured PCIe = 17.5 ms — which the ~24 ms of remaining
+   headroom absorbs, though it eats most of it.
+
+Option 1 is better and is the natural next step: it reduces memory *and* latency,
+and reuses work already done.
+
+### Remaining optimisations not yet taken
+
+- The down-projection currently issues one kernel per selected expert (8 launches per
+  layer) because each expert has its own activation vector. Batching those into one
+  kernel is straightforward and worth roughly another 2x on that half.
+- Attention's four packed linears per layer still use the torch dequant path and
+  should move to the same kernel.
+- No CUDA graphs yet on the clock path.
