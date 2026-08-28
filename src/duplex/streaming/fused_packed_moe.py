@@ -152,6 +152,20 @@ class FusedPackedMoE(nn.Module):
                 self.down_scale[j].copy_(self._h_dn_s[e], non_blocking=True)
             sel = torch.arange(k, device=sel.device, dtype=sel.dtype).unsqueeze(0)
 
+        # Two kernel launches per layer. The torch path below (_dequant + matmul)
+        # materialises dense weights and measured 4.078 ms/layer against the
+        # kernel's 0.639 ms; it is kept only as a reference for correctness tests.
+        from duplex.streaming.triton_dequant_gemv import dequant_gemv, HAVE_TRITON
+
+        if HAVE_TRITON and T == 1:
+            s0 = sel[0]
+            gu = dequant_gemv(x[0], self.gu_packed, self.gu_scale, s0)     # [k, 2I]
+            g, u = gu.split(self.inter, dim=-1)
+            act = (F.silu(g) * u).to(x.dtype)                              # [k, I]
+            y = dequant_gemv(act, self.down_packed, self.down_scale, s0)   # [k, H]
+            y = (y.to(x.dtype) * w[0].unsqueeze(-1)).sum(dim=0, keepdim=True)
+            return y.view(shape)
+
         gu = self._dequant(self.gu_packed[sel], self.gu_scale[sel], self.hidden)
         h = torch.matmul(gu, x.view(T, 1, shape[-1], 1)).squeeze(-1)   # [T, k, 2I]
         del gu

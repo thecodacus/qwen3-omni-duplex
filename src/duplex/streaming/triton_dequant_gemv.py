@@ -32,7 +32,7 @@ if HAVE_TRITON:
     @triton.jit
     def _dq_gemv_kernel(
         X, PK, SC, SEL, OUT,
-        K, R, NW,
+        K, R, NW, s_x,
         s_pk_e, s_pk_r, s_pk_c,
         s_sc_e, s_sc_r, s_sc_g,
         s_out_k, s_out_r,
@@ -71,7 +71,10 @@ if HAVE_TRITON:
                 mask=rmask[:, None, None] & cmask[None, :, :], other=0.0,
             ).to(tl.float32)
 
-            xv = tl.load(X + cols, mask=cmask, other=0.0).to(tl.float32)  # [NW_BLK, 8]
+            # s_x = 0: every expert reads the same activation vector (gate_up).
+            # s_x = K: each expert has its own (down projection), so one launch
+            # replaces the per-expert loop.
+            xv = tl.load(X + pid_k * s_x + cols, mask=cmask, other=0.0).to(tl.float32)
 
             prod = q.to(tl.float32) * sc * xv[None, :, :]
             acc += tl.sum(tl.sum(prod, axis=2), axis=1)
@@ -80,9 +83,9 @@ if HAVE_TRITON:
 
 
 def dequant_gemv(x, packed, scale, sel, group=32, block_r=64, nw_blk=8):
-    """y[j, r] = sum_c W[sel[j], r, c] * x[c],  W dequantized from int4 on the fly.
+    """y[j, r] = sum_c W[sel[j], r, c] * x[j, c],  W dequantized from int4 on the fly.
 
-    x       [K]              activations
+    x       [K] or [k, K]    activations; 1-D is shared across experts
     packed  [E, R, NW] int32 NW = ceil(K/8)
     scale   [E, R, NG]       NG = ceil(K/group)
     sel     [k] int32        selected experts
@@ -91,13 +94,17 @@ def dequant_gemv(x, packed, scale, sel, group=32, block_r=64, nw_blk=8):
     if not HAVE_TRITON:
         raise RuntimeError("triton not available")
     E, R, NW = packed.shape
-    K = x.numel()
     k = sel.numel()
+    if x.dim() == 1:
+        K, s_x = x.numel(), 0
+    else:
+        K, s_x = x.shape[-1], x.stride(0)
+    x = x.contiguous()
     out = torch.empty(k, R, device=x.device, dtype=torch.float32)
     grid = (triton.cdiv(R, block_r), k)
     _dq_gemv_kernel[grid](
         x, packed, scale, sel.to(torch.int32), out,
-        K, R, NW,
+        K, R, NW, s_x,
         packed.stride(0), packed.stride(1), packed.stride(2),
         scale.stride(0), scale.stride(1), scale.stride(2),
         out.stride(0), out.stride(1),
