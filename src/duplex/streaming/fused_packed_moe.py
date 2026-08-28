@@ -112,24 +112,40 @@ class FusedPackedMoE(nn.Module):
             self._h_dn_p, self._h_dn_s = dp, ds
             del gu_p, gu_s, dp, ds
         elif host_resident:
-            # pinned host storage + preallocated device staging for top_k experts
-            self._h_gu_p = gu_p.pin_memory()
-            self._h_gu_s = gu_s.pin_memory()
-            self._h_dn_p = dp.pin_memory()
-            self._h_dn_s = ds.pin_memory()
-            k = self.top_k
-            self.register_buffer("gu_packed", torch.empty(k, *gu_p.shape[1:],
-                                 dtype=gu_p.dtype, device=device), persistent=False)
-            self.register_buffer("gu_scale", torch.empty(k, *gu_s.shape[1:],
-                                 dtype=gu_s.dtype, device=device), persistent=False)
-            self.register_buffer("down_packed", torch.empty(k, *dp.shape[1:],
-                                 dtype=dp.dtype, device=device), persistent=False)
-            self.register_buffer("down_scale", torch.empty(k, *ds.shape[1:],
-                                 dtype=ds.dtype, device=device), persistent=False)
+            # One contiguous byte blob per expert, so staging is ONE copy per
+            # expert instead of four. 852 MB/token at 25.9 GB/s is only 33 ms of
+            # transfer, but 4 tensors x 8 experts x 40 layers = 1280 launches cost
+            # ~171 ms. Packing gets that to 320.
+            # TWO blobs, not one: `down` is not needed until `gate_up` has
+            # computed, so its copies can fly on a side stream during that matmul.
+            # A single blob forces both to be resident before any compute starts,
+            # which measured slower (7.45s) than 32 unpacked copies WITH overlap
+            # (6.53s) -- the overlap is worth more than the launch reduction, so
+            # take both.
+            E, k = self.num_experts, self.top_k
+            self._grp = []
+            for parts in ([gu_p, gu_s], [dp, ds]):
+                shapes = [tuple(t.shape[1:]) for t in parts]
+                dtypes = [t.dtype for t in parts]
+                nb = [t[0].numel() * t.element_size() for t in parts]
+                offs, o = [], 0
+                for n in nb:
+                    o = (o + 3) // 4 * 4             # keep int32 views aligned
+                    offs.append(o); o += n
+                total = (o + 3) // 4 * 4
+                blob = torch.empty(E, total, dtype=torch.uint8)
+                for e in range(E):
+                    for t, off, n in zip(parts, offs, nb):
+                        blob[e, off:off + n] = t[e].contiguous().view(torch.uint8).view(-1)
+                stage = torch.empty(k, total, dtype=torch.uint8, device=device)
+                self._grp.append(dict(host=blob.pin_memory(), stage=stage,
+                                      shapes=shapes, dtypes=dtypes, offs=offs, nb=nb))
+            del gu_p, gu_s, dp, ds
+            self._cp_stream = torch.cuda.Stream(device=device)
+            self._down_ready = torch.cuda.Event()
             self.register_buffer("_staged_idx",
                                  torch.arange(k, dtype=torch.int32, device=device),
                                  persistent=False)
-            del gu_p, gu_s, dp, ds
         else:
             self.register_buffer("gu_packed", gu_p, persistent=False)
             self.register_buffer("gu_scale", gu_s, persistent=False)
@@ -141,6 +157,12 @@ class FusedPackedMoE(nn.Module):
         self.hidden = hidden
         self.hid_out = hid_out
         self.inter_in = inter_in
+
+    def _views(self, g):
+        """Reinterpret a staged byte blob as its tensors, no copies."""
+        st = g["stage"]; k = st.shape[0]
+        return [st[:, o:o + n].view(dt).view(k, *sh)
+                for sh, dt, o, n in zip(g["shapes"], g["dtypes"], g["offs"], g["nb"])]
 
     @staticmethod
     def _dequant(packed, scale, cols):
@@ -193,16 +215,27 @@ class FusedPackedMoE(nn.Module):
             for t in range(T):
                 st = sel[t]
                 if self.host_resident:
-                    for j, e in enumerate(st.tolist()):
-                        self.gu_packed[j].copy_(self._h_gu_p[e], non_blocking=True)
-                        self.gu_scale[j].copy_(self._h_gu_s[e], non_blocking=True)
-                        self.down_packed[j].copy_(self._h_dn_p[e], non_blocking=True)
-                        self.down_scale[j].copy_(self._h_dn_s[e], non_blocking=True)
+                    idx = st.tolist()
+                    gg, dg = self._grp
+                    for j, e in enumerate(idx):          # needed immediately
+                        gg["stage"][j].copy_(gg["host"][e], non_blocking=True)
+                    cur = torch.cuda.current_stream()
+                    self._cp_stream.wait_stream(cur)
+                    with torch.cuda.stream(self._cp_stream):
+                        for j, e in enumerate(idx):      # overlaps gate_up below
+                            dg["stage"][j].copy_(dg["host"][e], non_blocking=True)
+                        self._down_ready.record(self._cp_stream)
+                    gu_p_v, gu_s_v = self._views(gg)
+                    dn_p_v, dn_s_v = self._views(dg)
                     st = self._staged_idx
-                gu = dequant_gemv(x[t], self.gu_packed, self.gu_scale, st)   # [k, 2I]
+                gp_, gs_ = (gu_p_v, gu_s_v) if self.host_resident else (self.gu_packed, self.gu_scale)
+                gu = dequant_gemv(x[t], gp_, gs_, st)                        # [k, 2I]
                 g, u = gu.split(self.inter, dim=-1)
                 act = (F.silu(g) * u).to(x.dtype)                            # [k, I]
-                y = dequant_gemv(act, self.down_packed, self.down_scale, st) # [k, H]
+                if self.host_resident:
+                    torch.cuda.current_stream().wait_event(self._down_ready)
+                dp_, ds_ = (dn_p_v, dn_s_v) if self.host_resident else (self.down_packed, self.down_scale)
+                y = dequant_gemv(act, dp_, ds_, st)                          # [k, H]
                 outs.append((y.to(x.dtype) * w[t].unsqueeze(-1)).sum(dim=0))
             return torch.stack(outs).view(shape)
 
