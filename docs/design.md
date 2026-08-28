@@ -279,3 +279,46 @@ embeddings, norms and `lm_head`.
 manual `.to()` calls. For the offline quality gate — which is latency-insensitive —
 CPU-only is the right tool, and `--cpu` selects it. The GPU split belongs with the
 llama.cpp port, where `--n-cpu-moe` already does this properly.
+
+## 9. Realtime — fused MoE, and llama.cpp is not mandatory
+
+Section 8 concluded transformers could not make the 80 ms deadline. That was wrong:
+it was true of transformers' *expert loop*, not of PyTorch.
+
+The shipped `SparseMoeBlock` is the Mixtral implementation — a Python loop over the
+selected experts, each iteration doing a `torch.where` and three small matmuls. At
+batch-1 decode that is ~720 kernel launches per Talker token across 20 layers, for
+190M active params that should read 380 MB and take ~1.05 ms on a 3060. Measured
+41.95 ms: **~40x overhead-bound**.
+
+`duplex.streaming.fused_moe` stacks each layer's experts once and replaces the loop
+with a gather plus batched matmul — the "gather+gemv strategy for MoE kernels
+instead of the standard grouped gemm" Thinking Machines described, arrived at from
+the same constraint.
+
+| stage | unfused mean / p99.9 | **fused** mean / p99.9 |
+|---|---|---|
+| talker decode | 41.95 / 47.09 | **17.36 / 19.84** |
+| code predictor (MTP) | 4.02 / 4.58 | 3.91 / 4.28 |
+| streaming vocoder | 10.79 / 16.58 | 10.52 / 15.57 |
+| **TOTAL** | 56.76 / 65.89 | **31.79 / 36.85** |
+| headroom for Thinker[0:24] | 14.1 ms | **43.1 ms** |
+
+RTX 3060, 200 frames, real weights for everything but the Thinker. 0/200 over budget.
+
+Whether the Thinker fits 43.1 ms: it is ~1.13B active params/token (226M attention +
+906M experts) over 24 layers at 2x the Talker's hidden size, so scaling the fused
+Talker's 17.36 ms suggests ~25-35 ms. Tight but plausible — and it needs the same
+fusion over `weight_packed`, which is an int4-aware gather rather than a bf16 one.
+
+### Two traps
+
+**Fuse on the host, not the GPU.** Stacking on-device holds the originals and the
+stacks at once — 6.2 GB of talker experts plus 6 GB of stacks OOMs a 12 GB card.
+Host RAM has 61 GB and the stacked model is the same size as the original.
+
+**`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is poison for deadline work.**
+Added to dodge the OOM above and left on, it cost nothing on the mean (33.52 vs
+31.79) but added a **68 ms p99.9 to the vocoder** — a stage the fusion does not
+touch — pushing TOTAL p99.9 to 90.43 and failing the budget. On a throughput
+benchmark it would have looked free.

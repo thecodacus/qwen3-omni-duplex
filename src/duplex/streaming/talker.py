@@ -29,7 +29,7 @@ from duplex.streaming.code2wav import StreamingCode2Wav
 from duplex.thesis.vocoder_standalone import load_code2wav
 
 
-def load_talker(model_path: str, device: str, dtype: torch.dtype):
+def load_talker(model_path: str, device: str, dtype: torch.dtype, fuse: bool = False):
     from safetensors.torch import load_file
     from transformers.models.qwen3_omni_moe import (
         Qwen3OmniMoeTalkerForConditionalGeneration as TK,
@@ -59,6 +59,12 @@ def load_talker(model_path: str, device: str, dtype: torch.dtype):
             f"{len(unexpected)} unexpected. Wrong transformers version? "
             f"(5.x expects fused experts; this checkpoint is per-expert)"
         )
+    if fuse:
+        # Fuse on the HOST, before the move. Stacking on-GPU has to hold the
+        # originals and the stacks simultaneously, which OOMs a 12GB card; host
+        # RAM has 61GB and the stacked model is the same size as the original.
+        from duplex.streaming.fused_moe import fuse_moe_blocks
+        fuse_moe_blocks(model)
     return model.to(device).eval(), cfg, len(state)
 
 
@@ -69,12 +75,16 @@ def main():
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--out", default="/root/q3o_out")
+    p.add_argument("--fuse", action="store_true",
+                   help="replace the Python expert loop with gather+bmm")
+    p.add_argument("--graph", action="store_true",
+                   help="capture the talker decode step in a CUDA graph")
     a = p.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = getattr(torch, a.dtype)
 
-    talker, tcfg, n_tk = load_talker(a.model, dev, dtype)
+    talker, tcfg, n_tk = load_talker(a.model, dev, dtype, fuse=a.fuse)
     tk_gb = torch.cuda.memory_allocated() / 1024**3 if dev == "cuda" else 0
     c2w, ccfg, n_c2w, _ = load_code2wav(a.model, dev, dtype)
     tot_gb = torch.cuda.memory_allocated() / 1024**3 if dev == "cuda" else 0
